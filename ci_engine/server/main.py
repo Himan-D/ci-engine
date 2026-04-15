@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # CI Engine - FastAPI Server
 
-import json
+import os
 from datetime import datetime
 from typing import Optional
 
@@ -11,7 +11,6 @@ from sqlalchemy.orm import Session
 
 from ci_engine.server.db import get_db, init_db
 from ci_engine.server.models import (
-    Base,
     Build,
     BuildStatus,
     BuildCreate,
@@ -26,16 +25,41 @@ from ci_engine.server.models import (
 )
 from ci_engine.core.pipeline import parse_pipeline
 from ci_engine.server.dashboard import router as dashboard_router
+from ci_engine.server.middleware import AuthenticationMiddleware
+from ci_engine.server.auth import AuthService, User
+from pydantic import BaseModel
+from ci_engine.server.middleware import (
+    create_access_token,
+    create_refresh_token,
+    verify_token,
+    get_current_user,
+)
 
 
 app = FastAPI(title="CI Engine", version="0.1.0")
 
+# CORS middleware first (outer)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+)
+
+# Auth middleware second (inner) - must be added AFTER CORS for correct order
+app.add_middleware(
+    AuthenticationMiddleware,
+    public_paths=[
+        "/",
+        "/health",
+        "/status",
+        "/docs",
+        "/openapi.json",
+        "/redoc",
+        "/api/auth/login",
+        "/api/auth/register",
+    ],
 )
 
 
@@ -270,3 +294,92 @@ def status_page(db: Session = Depends(get_db)):
             {"name": "Database", "status": "operational"},
         ],
     }
+
+
+# Auth endpoints
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class LoginResponse(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+
+
+class RegisterRequest(BaseModel):
+    username: str
+    password: str
+    role: str = "developer"
+
+
+class TokenRefreshRequest(BaseModel):
+    refresh_token: str
+
+
+class UserResponse(BaseModel):
+    id: int
+    username: str
+    role: str
+    is_active: bool
+
+    class Config:
+        from_attributes = True
+
+
+@app.post("/api/auth/register", response_model=UserResponse, tags=["auth"])
+def register_user(user_data: RegisterRequest, db: Session = Depends(get_db)):
+    """Register a new user."""
+    existing = db.query(User).filter(User.username == user_data.username).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Username already exists")
+
+    user = AuthService.create_user(db, user_data.username, user_data.password, user_data.role)
+    return user
+
+
+@app.post("/api/auth/login", response_model=LoginResponse, tags=["auth"])
+def login(credentials: LoginRequest, db: Session = Depends(get_db)):
+    """Login and get access/refresh tokens."""
+    user = AuthService.authenticate_user(db, credentials.username, credentials.password)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    access_token = create_access_token(user.id, user.username)
+    refresh_token = create_refresh_token(user.id)
+
+    return LoginResponse(
+        access_token=access_token,
+        refresh_token=refresh_token,
+    )
+
+
+@app.post("/api/auth/refresh", response_model=LoginResponse, tags=["auth"])
+def refresh_token(refresh_data: TokenRefreshRequest, db: Session = Depends(get_db)):
+    """Refresh access token using refresh token."""
+    try:
+        payload = verify_token(refresh_data.refresh_token)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+
+    if payload.type != "refresh":
+        raise HTTPException(status_code=401, detail="Invalid token type")
+
+    user = db.query(User).filter(User.id == int(payload.sub)).first()
+    if not user or not user.is_active:
+        raise HTTPException(status_code=401, detail="User not found or inactive")
+
+    access_token = create_access_token(user.id, user.username)
+    new_refresh_token = create_refresh_token(user.id)
+
+    return LoginResponse(
+        access_token=access_token,
+        refresh_token=new_refresh_token,
+    )
+
+
+@app.get("/api/auth/me", response_model=UserResponse, tags=["auth"])
+def get_me(current_user: User = Depends(get_current_user)):
+    """Get current user info."""
+    return current_user

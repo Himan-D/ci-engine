@@ -5,8 +5,6 @@
 import sys
 import argparse
 import requests
-import json
-from pathlib import Path
 
 
 class CIEngineCLI:

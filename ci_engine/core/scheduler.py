@@ -57,7 +57,6 @@ class Scheduler:
         pending = sum(1 for j in jobs if j.status == JobStatus.PENDING)
         running = sum(1 for j in jobs if j.status == JobStatus.RUNNING)
         failed = sum(1 for j in jobs if j.status == JobStatus.FAILED)
-        passed = sum(1 for j in jobs if j.status == JobStatus.PASSED)
 
         build = db.query(Build).filter(Build.id == build_id).first()
         if not build:

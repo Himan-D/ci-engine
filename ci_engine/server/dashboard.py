@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: MIT
 # CI Engine - Web Dashboard (HTML)
 
-from fastapi import APIRouter, Request, Depends
+from fastapi import APIRouter, Depends
 from fastapi.responses import HTMLResponse
 from sqlalchemy.orm import Session
 
 from ci_engine.server.db import get_db
-from ci_engine.server.models import Build, Agent, Job
+from ci_engine.server.models import Build, Agent
 
 router = APIRouter()
 

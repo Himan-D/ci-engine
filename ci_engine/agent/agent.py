@@ -10,7 +10,7 @@ from typing import Optional
 class Agent:
     """Build agent that executes jobs from the CI server."""
 
-    def __init__(self, server_url: str, name: str, tags: list[str] = None):
+    def __init__(self, server_url: str, name: str, tags: list[str] | None = None):
         self.server_url = server_url.rstrip("/")
         self.name = name
         self.tags = tags or []
@@ -111,7 +111,7 @@ class Agent:
                 json={"stream": stream, "line": line},
                 timeout=5,
             )
-        except:
+        except requests.RequestException:
             pass
 
     def complete_job(self, job_id: int, exit_code: int):
@@ -142,7 +142,7 @@ class Agent:
                             f"{self.server_url}/api/jobs/{job['id']}/start",
                             timeout=10,
                         )
-                    except:
+                    except requests.RequestException:
                         pass
 
                     exit_code = self.execute_job(job)
