@@ -193,6 +193,88 @@ class AuthService:
         """Get all tokens for a user."""
         return db.query(ApiToken).filter(ApiToken.user_id == user_id).all()
 
+    @staticmethod
+    def list_user_tokens_metadata(db, user_id: int) -> list[dict]:
+        """Get all tokens for a user with metadata (not raw tokens)."""
+        tokens = db.query(ApiToken).filter(ApiToken.user_id == user_id).all()
+        return [
+            {
+                "id": t.id,
+                "name": t.name,
+                "created_at": t.created_at,
+                "expires_at": t.expires_at,
+                "last_used": t.last_used,
+                "is_active": t.is_active,
+            }
+            for t in tokens
+        ]
+
+    @staticmethod
+    def revoke_token_by_id(db, token_id: int, user_id: int) -> bool:
+        """Revoke a specific token (must belong to user)."""
+        token = (
+            db.query(ApiToken)
+            .filter(
+                ApiToken.id == token_id,
+                ApiToken.user_id == user_id,
+            )
+            .first()
+        )
+        if token:
+            token.is_active = False
+            db.commit()
+            return True
+        return False
+
+    @staticmethod
+    def get_token_by_id(db, token_id: int, user_id: int) -> Optional[ApiToken]:
+        """Get token metadata by ID."""
+        return (
+            db.query(ApiToken)
+            .filter(
+                ApiToken.id == token_id,
+                ApiToken.user_id == user_id,
+            )
+            .first()
+        )
+
+    @staticmethod
+    def rotate_refresh_token(db, old_token_id: int, user_id: int) -> Optional[tuple[ApiToken, str]]:
+        """Rotate refresh token: invalidate old, create new."""
+        old_token = (
+            db.query(ApiToken)
+            .filter(
+                ApiToken.id == old_token_id,
+                ApiToken.user_id == user_id,
+                ApiToken.is_active,
+            )
+            .first()
+        )
+
+        if not old_token:
+            return None
+
+        old_token.is_active = False
+
+        new_token = generate_api_token()
+        new_token_hash = hash_api_token(new_token)
+
+        expires_at = None
+        if old_token.expires_at:
+            expires_at = old_token.expires_at
+
+        new_api_token = ApiToken(
+            token_hash=new_token_hash,
+            name=f"{old_token.name} (rotated)",
+            user_id=user_id,
+            expires_at=expires_at,
+        )
+        db.add(new_api_token)
+        db.commit()
+        db.refresh(new_api_token)
+
+        return new_api_token, new_token
+
 
 class Permission:
     """Permission constants."""
@@ -224,3 +306,43 @@ class Permission:
     @staticmethod
     def can_create_tokens(role: str) -> bool:
         return role in (Permission.ADMIN, Permission.DEVELOPER)
+
+
+class PasswordValidationError(Exception):
+    """Raised when password validation fails."""
+
+    pass
+
+
+class PasswordValidator:
+    """Validate password strength."""
+
+    MIN_LENGTH = 8
+    MAX_LENGTH = 128
+    REQUIRE_UPPERCASE = True
+    REQUIRE_LOWERCASE = True
+    REQUIRE_DIGIT = True
+    REQUIRE_SPECIAL = False
+
+    @classmethod
+    def validate(cls, password: str) -> list[str]:
+        """Validate password and return list of errors."""
+        errors = []
+
+        if len(password) < cls.MIN_LENGTH:
+            errors.append(f"Password must be at least {cls.MIN_LENGTH} characters")
+        if len(password) > cls.MAX_LENGTH:
+            errors.append(f"Password must not exceed {cls.MAX_LENGTH} characters")
+        if cls.REQUIRE_UPPERCASE and not any(c.isupper() for c in password):
+            errors.append("Password must contain at least one uppercase letter")
+        if cls.REQUIRE_LOWERCASE and not any(c.islower() for c in password):
+            errors.append("Password must contain at least one lowercase letter")
+        if cls.REQUIRE_DIGIT and not any(c.isdigit() for c in password):
+            errors.append("Password must contain at least one digit")
+
+        return errors
+
+
+def validate_password_strength(password: str) -> bool:
+    """Validate password meets strength requirements."""
+    return len(PasswordValidator.validate(password)) == 0

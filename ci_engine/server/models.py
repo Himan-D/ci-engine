@@ -42,6 +42,9 @@ class Build(Base):
     pipeline = Column(String(500), nullable=False)
     branch = Column(String(100), nullable=False)
     commit = Column(String(100), nullable=True)
+    repository = Column(String(500), nullable=True)
+    git_ref = Column(String(100), nullable=True)
+    clone_depth = Column(Integer, nullable=True)
     status = Column(SQLEnum(BuildStatus), default=BuildStatus.PENDING)
     created_at = Column(DateTime, default=datetime.utcnow)
     started_at = Column(DateTime, nullable=True)
@@ -64,6 +67,8 @@ class Job(Base):
     retry_count = Column(Integer, default=0)
     max_retries = Column(Integer, default=0)
     timeout_seconds = Column(Integer, default=3600)
+    env_vars = Column(Text, nullable=True)
+    working_dir = Column(String(500), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)
@@ -105,6 +110,9 @@ class BuildCreate(BaseModel):
     pipeline: str
     branch: str = "main"
     commit: Optional[str] = None
+    repository: Optional[str] = None
+    git_ref: Optional[str] = "main"
+    clone_depth: Optional[int] = None
 
 
 class BuildResponse(BaseModel):
@@ -112,6 +120,8 @@ class BuildResponse(BaseModel):
     pipeline: str
     branch: str
     commit: Optional[str]
+    repository: Optional[str]
+    git_ref: Optional[str]
     status: BuildStatus
     created_at: datetime
     started_at: Optional[datetime]
@@ -133,6 +143,8 @@ class JobResponse(BaseModel):
     retry_count: int
     max_retries: int
     timeout_seconds: int
+    env_vars: Optional[dict[str, str]] = {}
+    working_dir: Optional[str]
     created_at: datetime
     started_at: Optional[datetime]
     finished_at: Optional[datetime]

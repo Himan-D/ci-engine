@@ -11,14 +11,20 @@ def parse_pipeline(pipeline: str) -> list[dict[str, Any]]:
     Supports:
     - Simple steps with command
     - Steps with label and command
-    - Plugins and env vars
+    - Environment variables (list or dict format)
+    - Working directory
+    - Timeout
+    - Retry count
 
     Example:
         steps:
           - label: "Build"
             command: "make build"
-          - label: "Test"
-            command: "make test"
+            env:
+              DEBUG: "true"
+            working_directory: /app
+            timeout: 600
+            retry: 2
     """
     if not pipeline.strip():
         return []
@@ -37,9 +43,18 @@ def parse_pipeline(pipeline: str) -> list[dict[str, Any]]:
     if isinstance(data, dict):
         steps = data.get("steps", [])
         if isinstance(steps, list):
-            return steps
+            return _normalize_steps(steps)
 
     return []
+
+
+def _normalize_steps(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Normalize step format for consistent access."""
+    normalized = []
+    for step in steps:
+        normalized_step = dict(step)
+        normalized.append(normalized_step)
+    return normalized
 
 
 def parse_pipeline_file(path: str) -> list[dict[str, Any]]:

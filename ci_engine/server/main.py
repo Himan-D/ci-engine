@@ -31,7 +31,7 @@ from ci_engine.server.models import (
 from ci_engine.core.pipeline import parse_pipeline
 from ci_engine.server.dashboard import router as dashboard_router
 from ci_engine.server.middleware import AuthenticationMiddleware
-from ci_engine.server.auth import AuthService, User
+from ci_engine.server.auth import AuthService, User, TokenResponse
 from pydantic import BaseModel
 from ci_engine.server.middleware import (
     create_access_token,
@@ -81,10 +81,15 @@ app.include_router(dashboard_router)
 @app.post("/api/builds", response_model=BuildResponse)
 def create_build(build_data: BuildCreate, db: Session = Depends(get_db)):
     """Create a new build from a pipeline definition."""
+    import json
+
     build = Build(
         pipeline=build_data.pipeline,
         branch=build_data.branch,
         commit=build_data.commit,
+        repository=build_data.repository,
+        git_ref=build_data.git_ref,
+        clone_depth=build_data.clone_depth,
         status=BuildStatus.PENDING,
     )
     db.add(build)
@@ -93,12 +98,27 @@ def create_build(build_data: BuildCreate, db: Session = Depends(get_db)):
 
     steps = parse_pipeline(build_data.pipeline)
     for i, step in enumerate(steps):
+        env_vars = step.get("env")
+        if env_vars and isinstance(env_vars, list):
+            env_vars_dict = {}
+            for env in env_vars:
+                if "=" in env:
+                    key, val = env.split("=", 1)
+                    env_vars_dict[key] = val
+            env_vars = json.dumps(env_vars_dict) if env_vars_dict else None
+        elif env_vars and isinstance(env_vars, dict):
+            env_vars = json.dumps(env_vars)
+
         job = Job(
             build_id=build.id,
             step_index=i,
             label=step.get("label", f"Step {i}"),
             command=step.get("command", ""),
             status=JobStatus.PENDING,
+            env_vars=env_vars,
+            working_dir=step.get("working_directory"),
+            timeout_seconds=step.get("timeout", 3600),
+            max_retries=step.get("retry", 0),
         )
         db.add(job)
 
@@ -357,7 +377,13 @@ class UserResponse(BaseModel):
 
 @app.post("/api/auth/register", response_model=UserResponse, tags=["auth"])
 def register_user(user_data: RegisterRequest, db: Session = Depends(get_db)):
-    """Register a new user."""
+    """Register a new user with password validation."""
+    from ci_engine.server.auth import PasswordValidator
+
+    errors = PasswordValidator.validate(user_data.password)
+    if errors:
+        raise HTTPException(status_code=400, detail=errors)
+
     existing = db.query(User).filter(User.username == user_data.username).first()
     if existing:
         raise HTTPException(status_code=400, detail="Username already exists")
@@ -410,6 +436,88 @@ def refresh_token(refresh_data: TokenRefreshRequest, db: Session = Depends(get_d
 def get_me(current_user: User = Depends(get_current_user)):
     """Get current user info."""
     return current_user
+
+
+# Token management endpoints
+class TokenCreate(BaseModel):
+    name: str
+    expires_in_days: Optional[int] = 30
+
+
+class TokenListItem(BaseModel):
+    id: int
+    name: str
+    created_at: datetime
+    expires_at: Optional[datetime]
+    last_used: Optional[datetime]
+    is_active: bool
+
+    class Config:
+        from_attributes = True
+
+
+class TokenRefreshRequest(BaseModel):
+    token_id: int
+
+
+@app.post("/api/auth/tokens", response_model=TokenResponse, tags=["auth"])
+def create_token(
+    token_data: TokenCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Create a new API token."""
+    token_obj, raw_token = AuthService.create_api_token(
+        db, current_user.id, token_data.name, token_data.expires_in_days or 30
+    )
+    return TokenResponse(
+        token=raw_token,
+        name=token_obj.name,
+        created_at=token_obj.created_at,
+        expires_at=token_obj.expires_at,
+    )
+
+
+@app.get("/api/auth/tokens", response_model=list[TokenListItem], tags=["auth"])
+def list_tokens(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """List all API tokens for current user."""
+    return AuthService.list_user_tokens_metadata(db, current_user.id)
+
+
+@app.delete("/api/auth/tokens/{token_id}", tags=["auth"])
+def revoke_token(
+    token_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Revoke an API token."""
+    success = AuthService.revoke_token_by_id(db, token_id, current_user.id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Token not found")
+    return {"status": "revoked", "token_id": token_id}
+
+
+@app.post("/api/auth/tokens/refresh", response_model=TokenResponse, tags=["auth"])
+def rotate_token(
+    refresh_data: TokenRefreshRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Rotate an API token (create new, revoke old)."""
+    result = AuthService.rotate_refresh_token(db, refresh_data.token_id, current_user.id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Token not found or already inactive")
+
+    token_obj, raw_token = result
+    return TokenResponse(
+        token=raw_token,
+        name=token_obj.name,
+        created_at=token_obj.created_at,
+        expires_at=token_obj.expires_at,
+    )
 
 
 # Build cancellation endpoints
