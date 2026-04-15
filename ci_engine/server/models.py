@@ -5,7 +5,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Optional
 from pydantic import BaseModel
-from sqlalchemy import Column, Integer, String, DateTime, Text, ForeignKey, Enum as SQLEnum
+from sqlalchemy import Column, Integer, String, DateTime, Text, ForeignKey, Enum as SQLEnum, Boolean
 from sqlalchemy.orm import declarative_base, relationship
 
 Base = declarative_base()
@@ -26,6 +26,7 @@ class JobStatus(str, Enum):
     PASSED = "passed"
     FAILED = "failed"
     CANCELED = "canceled"
+    BLOCKED = "blocked"
 
 
 class AgentStatus(str, Enum):
@@ -60,6 +61,9 @@ class Job(Base):
     status = Column(SQLEnum(JobStatus), default=JobStatus.PENDING)
     agent_id = Column(Integer, ForeignKey("agents.id"), nullable=True)
     exit_code = Column(Integer, nullable=True)
+    retry_count = Column(Integer, default=0)
+    max_retries = Column(Integer, default=0)
+    timeout_seconds = Column(Integer, default=3600)
     created_at = Column(DateTime, default=datetime.utcnow)
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)
@@ -126,6 +130,9 @@ class JobResponse(BaseModel):
     command: str
     status: JobStatus
     exit_code: Optional[int]
+    retry_count: int
+    max_retries: int
+    timeout_seconds: int
     created_at: datetime
     started_at: Optional[datetime]
     finished_at: Optional[datetime]
@@ -159,6 +166,64 @@ class LogStreamResponse(BaseModel):
     timestamp: datetime
     stream: str
     line: str
+
+
+class WebhookConfig(Base):
+    __tablename__ = "webhook_configs"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(100), nullable=False)
+    url = Column(String(500), nullable=False)
+    events = Column(String(200), nullable=False)
+    secret = Column(String(200), nullable=True)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class Artifact(Base):
+    __tablename__ = "artifacts"
+
+    id = Column(Integer, primary_key=True)
+    build_id = Column(Integer, ForeignKey("builds.id"))
+    job_id = Column(Integer, ForeignKey("jobs.id"), nullable=True)
+    filename = Column(String(200), nullable=False)
+    size = Column(Integer, nullable=False)
+    content_type = Column(String(100), nullable=False)
+    storage_key = Column(String(500), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+# Pydantic models for webhooks
+class WebhookCreate(BaseModel):
+    name: str
+    url: str
+    events: list[str]
+    secret: Optional[str] = None
+
+
+class WebhookResponse(BaseModel):
+    id: int
+    name: str
+    url: str
+    events: list[str]
+    is_active: bool
+
+    class Config:
+        from_attributes = True
+
+
+# Pydantic models for artifacts
+class ArtifactResponse(BaseModel):
+    id: int
+    build_id: int
+    job_id: Optional[int]
+    filename: str
+    size: int
+    content_type: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
 
 
 # Update forward references

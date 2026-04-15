@@ -11,6 +11,8 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel
 import jwt
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 
 from ci_engine.server.db import get_db
 from ci_engine.server.auth import User
@@ -232,3 +234,14 @@ def require_role(*allowed_roles: str):
 
 require_admin = require_role("admin")
 require_developer = require_role("admin", "developer")
+
+
+limiter = Limiter(key_func=get_remote_address)
+
+
+def get_rate_limit_key(request: Request) -> str:
+    """Get rate limit key from request."""
+    auth_header = request.headers.get("Authorization")
+    if auth_header:
+        return auth_header
+    return get_remote_address(request)

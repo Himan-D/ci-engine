@@ -22,6 +22,11 @@ from ci_engine.server.models import (
     AgentCreate,
     AgentResponse,
     JobLog,
+    WebhookConfig,
+    WebhookCreate,
+    WebhookResponse,
+    Artifact,
+    ArtifactResponse,
 )
 from ci_engine.core.pipeline import parse_pipeline
 from ci_engine.server.dashboard import router as dashboard_router
@@ -34,6 +39,7 @@ from ci_engine.server.middleware import (
     verify_token,
     get_current_user,
 )
+from ci_engine.server.webhooks import WebhookService
 
 
 app = FastAPI(title="CI Engine", version="0.1.0")
@@ -383,3 +389,263 @@ def refresh_token(refresh_data: TokenRefreshRequest, db: Session = Depends(get_d
 def get_me(current_user: User = Depends(get_current_user)):
     """Get current user info."""
     return current_user
+
+
+# Build cancellation endpoints
+@app.post("/api/builds/{build_id}/cancel", tags=["builds"])
+def cancel_build(build_id: int, db: Session = Depends(get_db)):
+    """Cancel a build and all its jobs."""
+    build = db.query(Build).filter(Build.id == build_id).first()
+    if not build:
+        raise HTTPException(status_code=404, detail="Build not found")
+
+    if build.status in (BuildStatus.PASSED, BuildStatus.FAILED, BuildStatus.CANCELED):
+        raise HTTPException(status_code=400, detail=f"Build already {build.status}")
+
+    build.status = BuildStatus.CANCELED
+    build.finished_at = datetime.utcnow()
+
+    jobs = db.query(Job).filter(Job.build_id == build_id).all()
+    for job in jobs:
+        if job.status in (JobStatus.PENDING, JobStatus.ASSIGNED, JobStatus.RUNNING):
+            job.status = JobStatus.CANCELED
+            job.finished_at = datetime.utcnow()
+            if job.agent:
+                job.agent.status = AgentStatus.IDLE
+
+    db.commit()
+    return {"status": "canceled", "build_id": build_id}
+
+
+@app.post("/api/jobs/{job_id}/cancel", tags=["jobs"])
+def cancel_job(job_id: int, db: Session = Depends(get_db)):
+    """Cancel a specific job."""
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if job.status in (JobStatus.PASSED, JobStatus.FAILED, JobStatus.CANCELED):
+        raise HTTPException(status_code=400, detail=f"Job already {job.status}")
+
+    job.status = JobStatus.CANCELED
+    job.finished_at = datetime.utcnow()
+
+    if job.agent:
+        job.agent.status = AgentStatus.IDLE
+
+    pending_jobs = (
+        db.query(Job)
+        .filter(
+            Job.build_id == job.build_id,
+            Job.status.in_([JobStatus.PENDING, JobStatus.RUNNING, JobStatus.ASSIGNED]),
+        )
+        .count()
+    )
+
+    if pending_jobs == 0:
+        build = db.query(Build).filter(Build.id == job.build_id).first()
+        if build and build.status != BuildStatus.CANCELED:
+            build.status = BuildStatus.FAILED
+            build.finished_at = datetime.utcnow()
+
+    db.commit()
+    return {"status": "canceled", "job_id": job_id}
+
+
+@app.post("/api/builds/{build_id}/unblock", response_model=BuildResponse, tags=["builds"])
+def unblock_build(build_id: int, db: Session = Depends(get_db)):
+    """Unblock a blocked build, triggering pending jobs."""
+    build = db.query(Build).filter(Build.id == build_id).first()
+    if not build:
+        raise HTTPException(status_code=404, detail="Build not found")
+
+    blocked_jobs = (
+        db.query(Job).filter(Job.build_id == build_id, Job.status == JobStatus.BLOCKED).all()
+    )
+
+    if not blocked_jobs:
+        raise HTTPException(status_code=400, detail="No blocked jobs to unblock")
+
+    for job in blocked_jobs:
+        job.status = JobStatus.PENDING
+
+    if build.status == BuildStatus.PENDING:
+        build.status = BuildStatus.RUNNING
+
+    db.commit()
+    db.refresh(build)
+    return build
+
+
+# Agent heartbeat endpoint
+@app.post("/api/agents/{agent_id}/heartbeat", tags=["agents"])
+def agent_heartbeat(agent_id: int, db: Session = Depends(get_db)):
+    """Update agent last_seen timestamp."""
+    agent = db.query(Agent).filter(Agent.id == agent_id).first()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    agent.last_seen = datetime.utcnow()
+    agent.status = AgentStatus.IDLE
+    db.commit()
+    return {"status": "ok", "agent_id": agent_id}
+
+
+# Webhook endpoints
+@app.post("/api/webhooks", response_model=WebhookResponse, tags=["webhooks"])
+def create_webhook(webhook_data: WebhookCreate, db: Session = Depends(get_db)):
+    """Create a new webhook configuration."""
+    webhook = WebhookConfig(
+        name=webhook_data.name,
+        url=webhook_data.url,
+        events=",".join(webhook_data.events),
+        secret=webhook_data.secret,
+    )
+    db.add(webhook)
+    db.commit()
+    db.refresh(webhook)
+    return webhook
+
+
+@app.get("/api/webhooks", response_model=list[WebhookResponse], tags=["webhooks"])
+def list_webhooks(db: Session = Depends(get_db)):
+    """List all webhooks."""
+    return db.query(WebhookConfig).all()
+
+
+@app.get("/api/webhooks/{webhook_id}", response_model=WebhookResponse, tags=["webhooks"])
+def get_webhook(webhook_id: int, db: Session = Depends(get_db)):
+    """Get a specific webhook."""
+    webhook = db.query(WebhookConfig).filter(WebhookConfig.id == webhook_id).first()
+    if not webhook:
+        raise HTTPException(status_code=404, detail="Webhook not found")
+    return webhook
+
+
+@app.delete("/api/webhooks/{webhook_id}", tags=["webhooks"])
+def delete_webhook(webhook_id: int, db: Session = Depends(get_db)):
+    """Delete a webhook."""
+    webhook = db.query(WebhookConfig).filter(WebhookConfig.id == webhook_id).first()
+    if not webhook:
+        raise HTTPException(status_code=404, detail="Webhook not found")
+    db.delete(webhook)
+    db.commit()
+    return {"status": "deleted", "webhook_id": webhook_id}
+
+
+@app.post("/api/webhooks/github", tags=["webhooks"])
+def github_webhook(
+    payload: dict,
+    x_hub_signature_256: Optional[str] = None,
+    x_github_event: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    """Handle incoming GitHub webhooks."""
+    active_webhooks = (
+        db.query(WebhookConfig)
+        .filter(
+            WebhookConfig.is_active,
+            WebhookConfig.events.contains("github"),
+        )
+        .all()
+    )
+
+    for webhook in active_webhooks:
+        if webhook.secret:
+            if not WebhookService.verify_github_signature(
+                str(payload).encode(),
+                webhook.secret,
+                x_hub_signature_256 or "",
+            ):
+                continue
+
+    event = WebhookService.parse_github_event(payload, x_github_event or "")
+    if event:
+        build_info = WebhookService.extract_build_info(event)
+        if build_info:
+            pipeline = """
+steps:
+  - label: "Build"
+    command: "make build"
+  - label: "Test"
+    command: "make test"
+"""
+            build = Build(
+                pipeline=pipeline,
+                branch=build_info.get("branch", "main"),
+                commit=build_info.get("commit"),
+                status=BuildStatus.PENDING,
+            )
+            db.add(build)
+            db.commit()
+
+            steps = parse_pipeline(pipeline)
+            for i, step in enumerate(steps):
+                job = Job(
+                    build_id=build.id,
+                    step_index=i,
+                    label=step.get("label", f"Step {i}"),
+                    command=step.get("command", ""),
+                    status=JobStatus.PENDING,
+                )
+                db.add(job)
+            db.commit()
+            return {"status": "created", "build_id": build.id}
+
+    return {"status": "received"}
+
+
+# Artifact endpoints
+@app.post("/api/artifacts", response_model=ArtifactResponse, tags=["artifacts"])
+async def upload_artifact(
+    build_id: int,
+    job_id: Optional[int] = None,
+    filename: str = "",
+    content_type: str = "application/octet-stream",
+    db: Session = Depends(get_db),
+):
+    """Upload an artifact (placeholder - implement with actual file upload)."""
+    build = db.query(Build).filter(Build.id == build_id).first()
+    if not build:
+        raise HTTPException(status_code=404, detail="Build not found")
+
+    artifact = Artifact(
+        build_id=build_id,
+        job_id=job_id,
+        filename=filename or "artifact",
+        size=0,
+        content_type=content_type,
+        storage_key=f"builds/{build_id}/jobs/{job_id or 'none'}/{filename}",
+    )
+    db.add(artifact)
+    db.commit()
+    db.refresh(artifact)
+    return artifact
+
+
+@app.get(
+    "/api/builds/{build_id}/artifacts", response_model=list[ArtifactResponse], tags=["artifacts"]
+)
+def list_build_artifacts(build_id: int, db: Session = Depends(get_db)):
+    """List artifacts for a build."""
+    return db.query(Artifact).filter(Artifact.build_id == build_id).all()
+
+
+@app.get("/api/artifacts/{artifact_id}", response_model=ArtifactResponse, tags=["artifacts"])
+def get_artifact(artifact_id: int, db: Session = Depends(get_db)):
+    """Get artifact metadata."""
+    artifact = db.query(Artifact).filter(Artifact.id == artifact_id).first()
+    if not artifact:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    return artifact
+
+
+@app.delete("/api/artifacts/{artifact_id}", tags=["artifacts"])
+def delete_artifact(artifact_id: int, db: Session = Depends(get_db)):
+    """Delete an artifact."""
+    artifact = db.query(Artifact).filter(Artifact.id == artifact_id).first()
+    if not artifact:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    db.delete(artifact)
+    db.commit()
+    return {"status": "deleted", "artifact_id": artifact_id}
