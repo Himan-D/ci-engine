@@ -10,15 +10,35 @@ class Scheduler:
     """Scheduler for distributing jobs to agents."""
 
     @staticmethod
-    def find_available_agent(db, tags: Optional[list[str]] = None) -> Optional[Agent]:
+    def find_available_agent(db, required_tags: Optional[str] = None) -> Optional[Agent]:
         """Find an available agent that matches the required tags."""
         query = db.query(Agent).filter(Agent.status == AgentStatus.IDLE)
 
-        if tags:
-            for tag in tags:
-                query = query.filter(Agent.tags.contains(tag))
+        if required_tags:
+            tags_list = [t.strip() for t in required_tags.split(",")]
+            for tag in tags_list:
+                if "*" in tag:
+                    pattern = tag.replace("*", ".*")
+                    agent_tags = (
+                        db.query(Agent)
+                        .filter(Agent.status == AgentStatus.IDLE, Agent.tags.regexp_match(pattern))
+                        .first()
+                    )
+                    if agent_tags:
+                        return agent_tags
+                else:
+                    query = query.filter(Agent.tags.contains(tag))
 
         return query.first()
+
+    @staticmethod
+    def find_best_agent_by_priority(db, job_id: int) -> Optional[Agent]:
+        """Find best available agent for a job with priority matching."""
+        job = db.query(Job).filter(Job.id == job_id).first()
+        if not job:
+            return None
+        required = job.required_tags if job.required_tags else None
+        return Scheduler.find_available_agent(db, required)
 
     @staticmethod
     def assign_job(db, job_id: int, agent_id: int) -> bool:
@@ -39,13 +59,13 @@ class Scheduler:
 
     @staticmethod
     def get_next_pending_job(db, build_id: Optional[int] = None) -> Optional[Job]:
-        """Get the next pending job."""
+        """Get the next pending job ordered by priority (highest first) then step_index."""
         query = db.query(Job).filter(Job.status == JobStatus.PENDING)
 
         if build_id:
             query = query.filter(Job.build_id == build_id)
 
-        return query.order_by(Job.step_index).first()
+        return query.order_by(Job.priority.desc(), Job.step_index).first()
 
     @staticmethod
     def should_retry_job(db, job: Job) -> bool:

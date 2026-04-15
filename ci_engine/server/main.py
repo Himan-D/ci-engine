@@ -109,16 +109,25 @@ def create_build(build_data: BuildCreate, db: Session = Depends(get_db)):
         elif env_vars and isinstance(env_vars, dict):
             env_vars = json.dumps(env_vars)
 
+        matrix_vars = step.get("matrix_vars")
+        skip_condition = step.get("skip_condition")
+
+        job_status = JobStatus.SKIPPED if skip_condition else JobStatus.PENDING
+
         job = Job(
             build_id=build.id,
             step_index=i,
             label=step.get("label", f"Step {i}"),
             command=step.get("command", ""),
-            status=JobStatus.PENDING,
+            status=job_status,
             env_vars=env_vars,
             working_dir=step.get("working_directory"),
             timeout_seconds=step.get("timeout", 3600),
             max_retries=step.get("retry", 0),
+            priority=step.get("priority", 0),
+            required_tags=step.get("required_tags"),
+            matrix_vars=json.dumps(matrix_vars) if matrix_vars else None,
+            skip_condition=skip_condition,
         )
         db.add(job)
 

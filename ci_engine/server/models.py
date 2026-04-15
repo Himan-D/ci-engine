@@ -3,7 +3,7 @@
 
 from datetime import datetime
 from enum import Enum
-from typing import Optional
+from typing import Optional, Any
 from pydantic import BaseModel
 from sqlalchemy import Column, Integer, String, DateTime, Text, ForeignKey, Enum as SQLEnum, Boolean
 from sqlalchemy.orm import declarative_base, relationship
@@ -27,6 +27,7 @@ class JobStatus(str, Enum):
     FAILED = "failed"
     CANCELED = "canceled"
     BLOCKED = "blocked"
+    SKIPPED = "skipped"
 
 
 class AgentStatus(str, Enum):
@@ -67,8 +68,12 @@ class Job(Base):
     retry_count = Column(Integer, default=0)
     max_retries = Column(Integer, default=0)
     timeout_seconds = Column(Integer, default=3600)
+    priority = Column(Integer, default=0)
+    required_tags = Column(String(200), nullable=True)
     env_vars = Column(Text, nullable=True)
     working_dir = Column(String(500), nullable=True)
+    matrix_vars = Column(Text, nullable=True)
+    skip_condition = Column(String(500), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)
@@ -143,8 +148,12 @@ class JobResponse(BaseModel):
     retry_count: int
     max_retries: int
     timeout_seconds: int
+    priority: int
+    required_tags: Optional[str]
     env_vars: Optional[dict[str, str]] = {}
     working_dir: Optional[str]
+    matrix_vars: Optional[dict[str, Any]] = {}
+    skip_condition: Optional[str]
     created_at: datetime
     started_at: Optional[datetime]
     finished_at: Optional[datetime]
@@ -202,6 +211,8 @@ class Artifact(Base):
     size = Column(Integer, nullable=False)
     content_type = Column(String(100), nullable=False)
     storage_key = Column(String(500), nullable=False)
+    checksum = Column(String(64), nullable=True)
+    storage_location = Column(String(500), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
