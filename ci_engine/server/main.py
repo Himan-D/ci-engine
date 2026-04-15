@@ -25,6 +25,7 @@ from ci_engine.server.models import (
     JobLog,
 )
 from ci_engine.core.pipeline import parse_pipeline
+from ci_engine.server.dashboard import router as dashboard_router
 
 
 app = FastAPI(title="CI Engine", version="0.1.0")
@@ -41,6 +42,9 @@ app.add_middleware(
 @app.on_event("startup")
 def startup():
     init_db()
+
+
+app.include_router(dashboard_router)
 
 
 # Build endpoints
@@ -234,3 +238,35 @@ async def websocket_logs(websocket: WebSocket, job_id: int):
 @app.get("/health")
 def health_check():
     return {"status": "healthy"}
+
+
+@app.get("/api/stats")
+def get_stats(db: Session = Depends(get_db)):
+    """Get CI engine statistics."""
+    from datetime import datetime, timedelta
+
+    now = datetime.utcnow()
+    day_ago = now - timedelta(days=1)
+
+    builds_24h = db.query(Build).filter(Build.created_at >= day_ago).count()
+    total_builds = db.query(Build).count()
+    active_pipelines = db.query(Build).filter(Build.status == BuildStatus.RUNNING).count()
+
+    return {
+        "builds_24h": builds_24h,
+        "total_builds": total_builds,
+        "active_pipelines": active_pipelines,
+    }
+
+
+@app.get("/status")
+def status_page(db: Session = Depends(get_db)):
+    """Status page similar to Buildkite."""
+    return {
+        "status": "All Systems Operational",
+        "components": [
+            {"name": "API Server", "status": "operational"},
+            {"name": "Agent Pool", "status": "operational"},
+            {"name": "Database", "status": "operational"},
+        ],
+    }
