@@ -213,7 +213,9 @@ def start_job(job_id: int, db: Session = Depends(get_db)):
 
 @app.post("/api/jobs/{job_id}/complete")
 def complete_job(job_id: int, exit_code: int, db: Session = Depends(get_db)):
-    """Mark job as completed."""
+    """Mark job as completed with optional retry logic."""
+    from ci_engine.core.scheduler import Scheduler
+
     job = db.query(Job).filter(Job.id == job_id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -225,22 +227,41 @@ def complete_job(job_id: int, exit_code: int, db: Session = Depends(get_db)):
     if job.agent:
         job.agent.status = AgentStatus.IDLE
 
-    pending_jobs = (
-        db.query(Job).filter(Job.build_id == job.build_id, Job.status == JobStatus.PENDING).count()
-    )
+    retry_triggered = False
 
-    if pending_jobs == 0:
-        build = db.query(Build).filter(Build.id == job.build_id).first()
-        if build:
-            failed_jobs = (
-                db.query(Job)
-                .filter(Job.build_id == build.id, Job.status == JobStatus.FAILED)
-                .count()
-            )
-            build.status = BuildStatus.PASSED if failed_jobs == 0 else BuildStatus.FAILED
-            build.finished_at = datetime.utcnow()
+    if job.status == JobStatus.FAILED and job.max_retries > 0:
+        retried_job = Scheduler.retry_job(db, job)
+        if retried_job:
+            retry_triggered = True
+
+    if not retry_triggered:
+        pending_jobs = (
+            db.query(Job)
+            .filter(Job.build_id == job.build_id, Job.status == JobStatus.PENDING)
+            .count()
+        )
+
+        if pending_jobs == 0:
+            build = db.query(Build).filter(Build.id == job.build_id).first()
+            if build:
+                failed_jobs = (
+                    db.query(Job)
+                    .filter(Job.build_id == build.id, Job.status == JobStatus.FAILED)
+                    .count()
+                )
+                build.status = BuildStatus.PASSED if failed_jobs == 0 else BuildStatus.FAILED
+                build.finished_at = datetime.utcnow()
 
     db.commit()
+
+    if retry_triggered:
+        return {
+            "status": "completed",
+            "exit_code": exit_code,
+            "retry_triggered": True,
+            "new_job_id": job.id,
+        }
+
     return {"status": "completed", "exit_code": exit_code}
 
 
@@ -649,3 +670,72 @@ def delete_artifact(artifact_id: int, db: Session = Depends(get_db)):
     db.delete(artifact)
     db.commit()
     return {"status": "deleted", "artifact_id": artifact_id}
+
+
+@app.post("/api/admin/cleanup", tags=["admin"])
+def cleanup_old_builds(days: int = 30, db: Session = Depends(get_db)):
+    """Clean up old builds and their data. Returns count of deleted items."""
+    from datetime import timedelta
+
+    cutoff_date = datetime.utcnow() - timedelta(days=days)
+
+    old_builds = db.query(Build).filter(Build.created_at < cutoff_date).all()
+    deleted_builds = len(old_builds)
+
+    deleted_jobs = 0
+    deleted_artifacts = 0
+    deleted_logs = 0
+
+    for build in old_builds:
+        jobs = db.query(Job).filter(Job.build_id == build.id).all()
+        for job in jobs:
+            logs = db.query(JobLog).filter(JobLog.job_id == job.id).all()
+            deleted_logs += len(logs)
+            for log in logs:
+                db.delete(log)
+
+            db.delete(job)
+            deleted_jobs += 1
+
+        artifacts = db.query(Artifact).filter(Artifact.build_id == build.id).all()
+        for artifact in artifacts:
+            db.delete(artifact)
+            deleted_artifacts += 1
+
+        db.delete(build)
+
+    db.commit()
+
+    return {
+        "status": "cleaned",
+        "deleted_builds": deleted_builds,
+        "deleted_jobs": deleted_jobs,
+        "deleted_artifacts": deleted_artifacts,
+        "deleted_logs": deleted_logs,
+    }
+
+
+@app.post("/api/admin/reap-offline-agents", tags=["admin"])
+def reap_offline_agents(timeout_minutes: int = 5, db: Session = Depends(get_db)):
+    """Mark agents as offline if they haven't sent a heartbeat."""
+    from datetime import timedelta
+
+    cutoff = datetime.utcnow() - timedelta(minutes=timeout_minutes)
+
+    offline_agents = (
+        db.query(Agent)
+        .filter(
+            Agent.status != AgentStatus.OFFLINE,
+            Agent.last_seen < cutoff,
+        )
+        .all()
+    )
+
+    count = 0
+    for agent in offline_agents:
+        agent.status = AgentStatus.OFFLINE
+        count += 1
+
+    db.commit()
+
+    return {"status": "reaped", "agents_marked_offline": count}

@@ -5,6 +5,28 @@ import subprocess
 import os
 from typing import Optional
 from pathlib import Path
+from dataclasses import dataclass
+from enum import Enum
+
+
+class ExecutionStatus(str, Enum):
+    """Status of command execution."""
+
+    SUCCESS = "success"
+    FAILED = "failed"
+    TIMEOUT = "timeout"
+    ERROR = "error"
+
+
+@dataclass
+class ExecutionResult:
+    """Result of command execution."""
+
+    status: ExecutionStatus
+    exit_code: int
+    stdout: str
+    stderr: str
+    timed_out: bool = False
 
 
 class Executor:
@@ -45,6 +67,58 @@ class Executor:
 
         except Exception as e:
             return -1, "", str(e)
+
+    def execute_with_result(
+        self,
+        command: str,
+        env: Optional[dict] = None,
+        cwd: Optional[str] = None,
+        timeout: Optional[int] = 3600,
+    ) -> ExecutionResult:
+        """Execute a command and return detailed result."""
+        exec_env = os.environ.copy()
+        if env:
+            exec_env.update(env)
+
+        work_dir = cwd or str(self.workspace)
+
+        try:
+            result = subprocess.run(
+                command,
+                shell=True,
+                cwd=work_dir,
+                env=exec_env,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            return ExecutionResult(
+                status=ExecutionStatus.SUCCESS
+                if result.returncode == 0
+                else ExecutionStatus.FAILED,
+                exit_code=result.returncode,
+                stdout=result.stdout,
+                stderr=result.stderr,
+                timed_out=False,
+            )
+
+        except subprocess.TimeoutExpired:
+            return ExecutionResult(
+                status=ExecutionStatus.TIMEOUT,
+                exit_code=-1,
+                stdout="",
+                stderr=f"Command timed out after {timeout} seconds",
+                timed_out=True,
+            )
+
+        except Exception as e:
+            return ExecutionResult(
+                status=ExecutionStatus.ERROR,
+                exit_code=-1,
+                stdout="",
+                stderr=str(e),
+                timed_out=False,
+            )
 
     def cleanup_workspace(self, build_id: int):
         """Clean up workspace for a specific build."""
