@@ -2,9 +2,9 @@
 # CI Engine - Database setup
 
 import os
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
+from sqlalchemy.pool import StaticPool, QueuePool
 
 from ci_engine.server.models import Base
 
@@ -15,7 +15,7 @@ def get_database_url() -> str:
 
 
 def create_engine_func():
-    """Create database engine."""
+    """Create database engine with connection pooling."""
     url = get_database_url()
 
     if url.startswith("sqlite"):
@@ -23,9 +23,20 @@ def create_engine_func():
             url,
             connect_args={"check_same_thread": False},
             poolclass=StaticPool,
+            pool_pre_ping=True,
         )
 
-    return create_engine(url)
+    if url.startswith("postgresql"):
+        return create_engine(
+            url,
+            poolclass=QueuePool,
+            pool_size=20,
+            max_overflow=30,
+            pool_pre_ping=True,
+            pool_recycle=3600,
+        )
+
+    return create_engine(url, pool_pre_ping=True)
 
 
 engine = create_engine_func()
@@ -44,3 +55,13 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+def check_db_health() -> bool:
+    """Check database connectivity."""
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return True
+    except Exception:
+        return False

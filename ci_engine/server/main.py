@@ -2,12 +2,16 @@
 # CI Engine - FastAPI Server
 
 import os
+import json
 from datetime import datetime
 from typing import Optional
+from collections import defaultdict
 
 from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
+import asyncio
 
 from ci_engine.server.db import get_db, init_db
 from ci_engine.server.models import (
@@ -67,6 +71,159 @@ app.add_middleware(
         "/api/auth/register",
     ],
 )
+
+
+# WebSocket Connection Manager
+class ConnectionManager:
+    """Manages WebSocket connections for real-time updates."""
+
+    def __init__(self):
+        self.active_connections: dict[str, set[WebSocket]] = defaultdict(set)
+
+    async def connect(self, channel: str, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections[channel].add(websocket)
+
+    def disconnect(self, channel: str, websocket: WebSocket):
+        self.active_connections[channel].discard(websocket)
+
+    async def broadcast(self, channel: str, message: dict):
+        disconnected = set()
+        for connection in self.active_connections[channel]:
+            try:
+                await connection.send_json(message)
+            except Exception:
+                disconnected.add(connection)
+        for ws in disconnected:
+            self.active_connections[channel].discard(ws)
+
+    def get_count(self, channel: str) -> int:
+        return len(self.active_connections[channel])
+
+
+manager = ConnectionManager()
+
+
+# WebSocket endpoints for real-time streaming
+@app.websocket("/ws/jobs/{job_id}/logs")
+async def job_logs_stream(websocket: WebSocket, job_id: int):
+    """Stream logs for a specific job in real-time."""
+    channel = f"job_logs:{job_id}"
+    await manager.connect(channel, websocket)
+    try:
+        while True:
+            try:
+                data = await asyncio.wait_for(websocket.receive_text(), timeout=30)
+                message = json.loads(data)
+                if message.get("type") == "ping":
+                    await websocket.send_json({"type": "pong"})
+            except asyncio.TimeoutError:
+                await websocket.send_json({"type": "pong"})
+    except WebSocketDisconnect:
+        manager.disconnect(channel, websocket)
+
+
+@app.websocket("/ws/builds/{build_id}")
+async def build_updates_stream(websocket: WebSocket, build_id: int):
+    """Real-time build progress updates."""
+    channel = f"build:{build_id}"
+    await manager.connect(channel, websocket)
+    try:
+        while True:
+            try:
+                data = await asyncio.wait_for(websocket.receive_text(), timeout=30)
+                message = json.loads(data)
+                if message.get("type") == "ping":
+                    await websocket.send_json({"type": "pong"})
+            except asyncio.TimeoutError:
+                await websocket.send_json({"type": "pong"})
+    except WebSocketDisconnect:
+        manager.disconnect(channel, websocket)
+
+
+@app.websocket("/ws/builds")
+async def all_builds_stream(websocket: WebSocket):
+    """Subscribe to all build updates."""
+    channel = "builds:all"
+    await manager.connect(channel, websocket)
+    try:
+        while True:
+            try:
+                data = await asyncio.wait_for(websocket.receive_text(), timeout=30)
+                message = json.loads(data)
+                if message.get("type") == "ping":
+                    await websocket.send_json({"type": "pong"})
+            except asyncio.TimeoutError:
+                await websocket.send_json({"type": "pong"})
+    except WebSocketDisconnect:
+        manager.disconnect(channel, websocket)
+
+
+def broadcast_job_status(job_id: int, build_id: int, status: str, exit_code: Optional[int] = None):
+    """Broadcast job status change to all subscribers."""
+    asyncio.create_task(
+        manager.broadcast(
+            f"build:{build_id}",
+            {
+                "type": "job_status",
+                "job_id": job_id,
+                "build_id": build_id,
+                "status": status,
+                "exit_code": exit_code,
+            },
+        )
+    )
+    asyncio.create_task(
+        manager.broadcast(
+            "builds:all",
+            {
+                "type": "job_status",
+                "job_id": job_id,
+                "build_id": build_id,
+                "status": status,
+                "exit_code": exit_code,
+            },
+        )
+    )
+
+
+def broadcast_build_status(
+    build_id: int,
+    status: str,
+    jobs_total: int,
+    jobs_passed: int,
+    jobs_failed: int,
+    jobs_running: int,
+):
+    """Broadcast build status change to all subscribers."""
+    asyncio.create_task(
+        manager.broadcast(
+            f"build:{build_id}",
+            {
+                "type": "build_status",
+                "build_id": build_id,
+                "status": status,
+                "jobs_total": jobs_total,
+                "jobs_passed": jobs_passed,
+                "jobs_failed": jobs_failed,
+                "jobs_running": jobs_running,
+            },
+        )
+    )
+    asyncio.create_task(
+        manager.broadcast(
+            "builds:all",
+            {
+                "type": "build_status",
+                "build_id": build_id,
+                "status": status,
+                "jobs_total": jobs_total,
+                "jobs_passed": jobs_passed,
+                "jobs_failed": jobs_failed,
+                "jobs_running": jobs_running,
+            },
+        )
+    )
 
 
 @app.on_event("startup")
@@ -198,6 +355,108 @@ def get_agent(agent_id: int, db: Session = Depends(get_db)):
     return agent
 
 
+@app.get("/api/agents/{agent_id}/metrics")
+def get_agent_metrics(agent_id: int, db: Session = Depends(get_db)):
+    """Get metrics for a specific agent including CPU, memory, disk, and job stats."""
+    import psutil
+
+    agent = db.query(Agent).filter(Agent.id == agent_id).first()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    cpu_percent = psutil.cpu_percent(interval=0.1)
+    memory = psutil.virtual_memory()
+    disk = psutil.disk_usage("/")
+
+    running_jobs = (
+        db.query(Job).filter(Job.agent_id == agent_id, Job.status == JobStatus.RUNNING).count()
+    )
+
+    completed_jobs = (
+        db.query(Job)
+        .filter(Job.agent_id == agent_id, Job.status.in_([JobStatus.PASSED, JobStatus.FAILED]))
+        .count()
+    )
+
+    return {
+        "agent_id": agent_id,
+        "agent_name": agent.name,
+        "status": agent.status.value,
+        "system": {
+            "cpu_percent": round(cpu_percent, 1),
+            "memory_percent": memory.percent,
+            "memory_used_mb": round(memory.used / (1024 * 1024), 2),
+            "memory_available_mb": round(memory.available / (1024 * 1024), 2),
+            "disk_percent": disk.percent,
+            "disk_free_gb": round(disk.free / (1024**3), 2),
+        },
+        "jobs": {
+            "running": running_jobs,
+            "completed_total": completed_jobs,
+        },
+        "last_seen": agent.last_seen.isoformat() if agent.last_seen else None,
+    }
+
+
+@app.get("/api/agents/metrics/summary")
+def get_agents_metrics_summary(db: Session = Depends(get_db)):
+    """Get summary metrics for all agents."""
+    import psutil
+
+    all_agents = db.query(Agent).all()
+
+    cpu_percent = psutil.cpu_percent(interval=0.1)
+    memory = psutil.virtual_memory()
+
+    agents_by_status = {
+        "idle": 0,
+        "busy": 0,
+        "offline": 0,
+    }
+    total_jobs_running = 0
+    total_jobs_completed = 0
+
+    for agent in all_agents:
+        status_key = agent.status.value.lower()
+        if status_key in agents_by_status:
+            agents_by_status[status_key] += 1
+
+        running = (
+            db.query(Job).filter(Job.agent_id == agent.id, Job.status == JobStatus.RUNNING).count()
+        )
+        completed = (
+            db.query(Job)
+            .filter(Job.agent_id == agent.id, Job.status.in_([JobStatus.PASSED, JobStatus.FAILED]))
+            .count()
+        )
+        total_jobs_running += running
+        total_jobs_completed += completed
+
+    return {
+        "timestamp": datetime.utcnow().isoformat(),
+        "system": {
+            "cpu_percent": round(cpu_percent, 1),
+            "memory_percent": memory.percent,
+        },
+        "agents": {
+            "total": len(all_agents),
+            "by_status": agents_by_status,
+        },
+        "jobs": {
+            "running": total_jobs_running,
+            "completed_total": total_jobs_completed,
+        },
+    }
+
+
+@app.get("/api/scaling/recommendations")
+def get_scaling_recommendations(db: Session = Depends(get_db)):
+    """Get auto-scaling recommendations based on current state."""
+    from ci_engine.core.scaler import check_and_trigger_scaling
+
+    return check_and_trigger_scaling(db)
+
+
 # Job endpoints
 @app.post("/api/jobs/{job_id}/claim")
 def claim_job(job_id: int, agent_id: int, db: Session = Depends(get_db)):
@@ -237,6 +496,8 @@ def start_job(job_id: int, db: Session = Depends(get_db)):
         build.started_at = datetime.utcnow()
 
     db.commit()
+
+    broadcast_job_status(job_id, job.build_id, "running")
     return {"status": "started"}
 
 
@@ -283,6 +544,24 @@ def complete_job(job_id: int, exit_code: int, db: Session = Depends(get_db)):
 
     db.commit()
 
+    build = db.query(Build).filter(Build.id == job.build_id).first()
+    if build:
+        jobs_total = db.query(Job).filter(Job.build_id == build.id).count()
+        jobs_passed = (
+            db.query(Job).filter(Job.build_id == build.id, Job.status == JobStatus.PASSED).count()
+        )
+        jobs_failed = (
+            db.query(Job).filter(Job.build_id == build.id, Job.status == JobStatus.FAILED).count()
+        )
+        jobs_running = (
+            db.query(Job).filter(Job.build_id == build.id, Job.status == JobStatus.RUNNING).count()
+        )
+
+        broadcast_job_status(job_id, job.build_id.value, job.status.value, exit_code)
+        broadcast_build_status(
+            build.id, build.status.value, jobs_total, jobs_passed, jobs_failed, jobs_running
+        )
+
     if retry_triggered:
         return {
             "status": "completed",
@@ -318,6 +597,98 @@ async def websocket_logs(websocket: WebSocket, job_id: int):
 @app.get("/health")
 def health_check():
     return {"status": "healthy"}
+
+
+@app.get("/health/deep")
+def deep_health_check(db: Session = Depends(get_db)):
+    """Deep health check with database and system status."""
+    import shutil
+    import psutil
+    from sqlalchemy import text
+
+    try:
+        db.execute(text("SELECT 1"))
+        db_status = "ok"
+    except Exception as e:
+        db_status = f"error: {str(e)}"
+
+    disk = shutil.disk_usage("/")
+    disk_free_gb = round(disk.free / (1024**3), 2)
+    disk_total_gb = round(disk.total / (1024**3), 2)
+
+    memory = psutil.virtual_memory()
+    cpu_percent = psutil.cpu_percent(interval=0.1)
+
+    agents_online = db.query(Agent).filter(Agent.status == AgentStatus.IDLE).count()
+    agents_busy = db.query(Agent).filter(Agent.status == AgentStatus.BUSY).count()
+    agents_offline = db.query(Agent).filter(Agent.status == AgentStatus.OFFLINE).count()
+
+    ws_connections = sum(len(connections) for connections in manager.active_connections.values())
+
+    return {
+        "status": "healthy" if db_status == "ok" else "degraded",
+        "database": db_status,
+        "system": {
+            "cpu_percent": cpu_percent,
+            "memory_percent": memory.percent,
+            "disk_free_gb": disk_free_gb,
+            "disk_total_gb": disk_total_gb,
+        },
+        "agents": {
+            "online": agents_online,
+            "busy": agents_busy,
+            "offline": agents_offline,
+            "total": agents_online + agents_busy + agents_offline,
+        },
+        "websockets": {
+            "total_connections": ws_connections,
+            "channels": len(manager.active_connections),
+        },
+    }
+
+
+@app.get("/metrics")
+def prometheus_metrics():
+    """Prometheus metrics endpoint."""
+    from ci_engine.core.metrics import metrics_endpoint
+
+    return Response(content=metrics_endpoint.get_metrics(), media_type="text/plain")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Graceful shutdown handler - drain connections and finish jobs."""
+    print("Starting graceful shutdown...")
+
+    active_builds = []
+    for channel in manager.active_connections.keys():
+        if channel.startswith("build:"):
+            build_id = channel.split(":")[1]
+            active_builds.append(build_id)
+
+    print(f"Broadcasting shutdown to {len(active_builds)} active builds...")
+
+    await manager.broadcast(
+        "builds:all",
+        {"type": "shutdown", "message": "Server is shutting down"},
+    )
+
+    for channel in list(manager.active_connections.keys()):
+        connections = list(manager.active_connections[channel])
+        for ws in connections:
+            try:
+                await ws.close(code=1012, reason="Server shutdown")
+            except Exception:
+                pass
+        manager.active_connections[channel].clear()
+
+    print("WebSocket connections closed")
+
+    from ci_engine.server.db import engine
+
+    engine.dispose()
+
+    print("Database connections closed. Shutdown complete.")
 
 
 @app.get("/api/stats")
@@ -439,6 +810,26 @@ def refresh_token(refresh_data: TokenRefreshRequest, db: Session = Depends(get_d
         access_token=access_token,
         refresh_token=new_refresh_token,
     )
+
+
+@app.get("/api/auth/github/login", tags=["auth"])
+def github_login():
+    """Redirect to GitHub for OAuth login."""
+    import secrets
+
+    state = secrets.token_urlsafe(32)
+    from ci_engine.server.github_oauth import get_github_oauth_url
+
+    url = get_github_oauth_url(state)
+    return {"authorization_url": url, "state": state}
+
+
+@app.get("/api/auth/github/callback", tags=["auth"])
+def github_callback(code: str, state: str):
+    """Handle GitHub OAuth callback."""
+    from ci_engine.server.github_oauth import handle_github_callback
+
+    return handle_github_callback(code, state)
 
 
 @app.get("/api/auth/me", response_model=UserResponse, tags=["auth"])

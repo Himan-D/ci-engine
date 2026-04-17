@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 from sqlalchemy import Column, Integer, String, DateTime, Boolean
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from ci_engine.server.models import Base
 
@@ -51,8 +51,7 @@ class UserResponse(BaseModel):
     created_at: datetime
     is_active: bool
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class TokenCreate(BaseModel):
@@ -66,8 +65,7 @@ class TokenResponse(BaseModel):
     created_at: datetime
     expires_at: Optional[datetime]
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class TokenVerify(BaseModel):

@@ -4,7 +4,7 @@
 from datetime import datetime
 from enum import Enum
 from typing import Optional, Any
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy import Column, Integer, String, DateTime, Text, ForeignKey, Enum as SQLEnum, Boolean
 from sqlalchemy.orm import declarative_base, relationship
 
@@ -133,8 +133,7 @@ class BuildResponse(BaseModel):
     finished_at: Optional[datetime]
     jobs: list["JobResponse"] = []
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class JobResponse(BaseModel):
@@ -158,8 +157,7 @@ class JobResponse(BaseModel):
     started_at: Optional[datetime]
     finished_at: Optional[datetime]
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class AgentCreate(BaseModel):
@@ -178,8 +176,7 @@ class AgentResponse(BaseModel):
     registered_at: datetime
     last_seen: Optional[datetime]
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class LogStreamResponse(BaseModel):
@@ -231,8 +228,7 @@ class WebhookResponse(BaseModel):
     events: list[str]
     is_active: bool
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 # Pydantic models for artifacts
@@ -245,8 +241,7 @@ class ArtifactResponse(BaseModel):
     content_type: str
     created_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 # Update forward references

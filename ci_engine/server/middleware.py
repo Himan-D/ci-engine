@@ -129,23 +129,61 @@ class AuthenticationMiddleware(BaseHTTPMiddleware):
         self.public_paths = public_paths or [
             "/",
             "/health",
+            "/health/deep",
             "/status",
             "/docs",
             "/openapi.json",
             "/redoc",
             "/api/auth/login",
             "/api/auth/register",
+            "/api/stats",
+            "/ws/",
         ]
+
+        self.ip_allowlist = self._load_ip_allowlist()
+
+    def _load_ip_allowlist(self) -> Optional[list[str]]:
+        """Load IP allowlist from environment variable."""
+        allowlist_str = os.environ.get("CI_ENGINE_IP_ALLOWLIST", "")
+        if not allowlist_str:
+            return None
+        return [ip.strip() for ip in allowlist_str.split(",") if ip.strip()]
+
+    def _is_ip_allowed(self, ip: str) -> bool:
+        """Check if IP is allowed."""
+        if not self.ip_allowlist:
+            return True
+
+        for allowed in self.ip_allowlist:
+            if allowed == ip:
+                return True
+            if allowed.endswith("*"):
+                prefix = allowed[:-1]
+                if ip.startswith(prefix):
+                    return True
+        return False
 
     def _is_public_path(self, path: str) -> bool:
         """Check if path is public."""
+        if not path:
+            return True
+        path = path.rstrip("/")
         for public in self.public_paths:
-            if path == public or path.startswith(f"{public}/"):
+            public = public.rstrip("/")
+            if path == public or path.startswith(f"{public}/") or path.startswith(public):
                 return True
         return False
 
     async def dispatch(self, request: Request, call_next):
         """Process request through authentication."""
+        client_ip = request.client.host if request.client else None
+
+        if client_ip and not self._is_ip_allowed(client_ip):
+            return JSONResponse(
+                status_code=status.HTTP_403_FORBIDDEN,
+                content={"detail": "IP address not allowed"},
+            )
+
         if self._is_public_path(request.url.path):
             return await call_next(request)
 

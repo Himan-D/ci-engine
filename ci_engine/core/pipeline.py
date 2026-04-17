@@ -7,6 +7,15 @@ from typing import Any
 from itertools import product
 
 
+class StepType:
+    """Pipeline step types."""
+
+    COMMAND = "command"
+    WAIT = "wait"
+    BLOCK = "block"
+    TRIGGER = "trigger"
+
+
 def parse_pipeline(pipeline: str) -> list[dict[str, Any]]:
     """Parse a pipeline definition from YAML string.
 
@@ -19,6 +28,9 @@ def parse_pipeline(pipeline: str) -> list[dict[str, Any]]:
     - Retry count
     - Matrix expansion
     - Conditional steps (if:)
+    - Wait steps (pause execution)
+    - Block steps (manual approval)
+    - Trigger steps (trigger another pipeline)
 
     Example:
         steps:
@@ -35,6 +47,9 @@ def parse_pipeline(pipeline: str) -> list[dict[str, Any]]:
               os: [linux, windows]
               node: [14, 16]
             if: "{{.branch}} == 'main'"
+          - wait
+          - block: "Deploy to production?"
+          - command: "deploy.sh"
     """
     if not pipeline.strip():
         return []
@@ -60,14 +75,35 @@ def parse_pipeline(pipeline: str) -> list[dict[str, Any]]:
     return []
 
 
+def _detect_step_type(step: dict[str, Any]) -> str:
+    """Detect the type of step based on its structure."""
+    if "command" in step and step["command"]:
+        return StepType.COMMAND
+    if step.get("wait") is not None:
+        return StepType.WAIT
+    if "block" in step or step.get("type") == "block":
+        return StepType.BLOCK
+    if "trigger" in step or step.get("type") == "trigger":
+        return StepType.TRIGGER
+    return StepType.COMMAND
+
+
 def _expand_matrix_steps(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Expand matrix variables into multiple jobs."""
     expanded = []
 
     for step in steps:
+        step_type = _detect_step_type(step)
+
+        if step_type in (StepType.WAIT, StepType.BLOCK, StepType.TRIGGER):
+            normalized = _normalize_step(step, step_type)
+            expanded.append(normalized)
+            continue
+
         matrix = step.get("matrix")
         if not matrix:
-            expanded.append(step)
+            normalized = _normalize_step(step, step_type)
+            expanded.append(normalized)
             continue
 
         keys = list(matrix.keys())
@@ -83,6 +119,37 @@ def _expand_matrix_steps(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
             expanded.append(new_step)
 
     return expanded
+
+
+def _normalize_step(step: dict[str, Any], step_type: str) -> dict[str, Any]:
+    """Normalize a step to have consistent structure."""
+    normalized = dict(step)
+
+    if step_type == StepType.WAIT:
+        normalized["step_type"] = StepType.WAIT
+        normalized["label"] = step.get("wait") or "Wait"
+        normalized["wait_seconds"] = step.get("wait_seconds", step.get("seconds", 0))
+        if not step.get("wait"):
+            normalized["label"] = f"Wait {normalized['wait_seconds']}s"
+
+    elif step_type == StepType.BLOCK:
+        normalized["step_type"] = StepType.BLOCK
+        block_field = step.get("block")
+        if isinstance(block_field, str):
+            normalized["label"] = block_field
+        else:
+            normalized["label"] = step.get("label", "Manual approval")
+        normalized["blocking"] = True
+
+    elif step_type == StepType.TRIGGER:
+        normalized["step_type"] = StepType.TRIGGER
+        normalized["label"] = step.get("label", "Trigger pipeline")
+        normalized["trigger_pipeline"] = step.get("trigger")
+
+    else:
+        normalized["step_type"] = step_type
+
+    return normalized
 
 
 def _evaluate_conditionals(
