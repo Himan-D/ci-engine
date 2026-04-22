@@ -44,28 +44,52 @@ CI Engine is a continuous integration/continuous deployment platform that runs b
 
 ```
 ci-engine/
-├── ci_engine/              # Main package
-│   ├── server/             # FastAPI server
-│   │   ├── main.py         # App entry, routes
-│   │   ├── models.py       # DB models & Pydantic schemas
-│   │   ├── db.py           # Database setup
-│   │   ├── dashboard.py    # Web UI routes
-│   │   ├── auth.py         # Authentication & RBAC
-│   │   └── webhooks.py     # GitHub webhook integration
-│   ├── agent/              # Build agent
-│   │   └── agent.py        # Agent implementation
-│   ├── core/               # Core logic
-│   │   ├── pipeline.py     # Pipeline parsing
-│   │   ├── scheduler.py    # Job scheduling
-│   │   ├── executor.py     # Command execution
-│   │   └── secrets.py      # Secret management
-│   └── cli.py              # CLI tool
-├── tests/                  # Test suite (26 tests)
-│   ├── unit/               # Unit tests
-│   └── conftest.py         # Shared fixtures
-├── pyproject.toml          # Project config
-├── README.md               # This file
-└── AGENTS.md              # AI agent development guide
+├── ci_engine/                    # Main package
+│   ├── __init__.py
+│   ├── cli.py                    # CLI tool
+│   ├── agent/                    # Build agent
+│   │   ├── __init__.py
+│   │   ├── agent.py             # Agent implementation
+│   │   └── git.py               # Git operations
+│   ├── core/                    # Core logic
+│   │   ├── __init__.py
+│   │   ├── artifacts.py         # S3 artifact storage
+│   │   ├── audit.py            # Audit logging
+│   │   ├── container.py         # Docker executor
+│   │   ├── environments.py      # Environment groups
+│   │   ├── executor.py         # Command execution
+│   │   ├── logging.py          # Structured logging
+│   │   ├── metrics.py          # Prometheus metrics
+│   │   ├── notifications.py    # Slack/Discord/Email
+│   │   ├── pipeline.py         # YAML pipeline parsing
+│   │   ├── scaler.py           # Auto-scaling
+│   │   ├── scheduler.py        # Job scheduling
+│   │   ├── secrets.py          # Fernet encryption
+│   │   ├── ssh_keys.py         # SSH key management
+│   │   └── triggers.py         # Pipeline triggers
+│   └── server/                  # FastAPI server
+│       ├── __init__.py
+│       ├── auth.py              # JWT/bcrypt auth
+│       ├── dashboard.py         # Web UI routes
+│       ├── db.py               # Database setup
+│       ├── github_oauth.py     # GitHub OAuth
+│       ├── main.py             # API routes
+│       ├── middleware.py       # Rate limiting
+│       ├── models.py           # SQLAlchemy models
+│       └── webhooks.py         # GitHub webhooks
+├── tests/                       # Test suite (26 tests)
+│   ├── conftest.py
+│   └── unit/
+│       ├── test_auth.py
+│       ├── test_executor.py
+│       └── test_pipeline.py
+├── Dockerfile.server            # Docker image
+├── Dockerfile.agent            # Agent Docker image
+├── docker-compose.yml         # Local development
+├── docker-compose.prod.yml    # Production config
+├── pyproject.toml            # Project config
+├── README.md                  # This file
+└── AGENTS.md                  # AI agent guide
 ```
 
 ## Quick Start
