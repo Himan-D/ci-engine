@@ -42,6 +42,7 @@ class Agent:
         server_url: str,
         name: str,
         tags: list[str] | None = None,
+        skills: list[str] | None = None,
         use_websocket: bool = True,
         max_parallel_jobs: int = 1,
         workspace_prefix: str = "/tmp/ci-engine-workspace",
@@ -53,6 +54,7 @@ class Agent:
         self.max_memory_mb = max_memory_mb
         self.max_cpu_percent = max_cpu_percent
         self.tags = tags or []
+        self.skills = skills or []
         self.agent_id: Optional[int] = None
         self.use_websocket = use_websocket
         self.max_parallel_jobs = max_parallel_jobs
@@ -74,12 +76,15 @@ class Agent:
                     "name": self.name,
                     "hostname": self._get_hostname(),
                     "tags": self.tags,
+                    "skills": self.skills,
                 },
                 timeout=10,
             )
             if response.status_code == 200:
                 self.agent_id = response.json().get("id")
                 print(f"Registered as agent #{self.agent_id}")
+                if self.skills:
+                    print(f"Registered skills: {', '.join(self.skills)}")
                 return True
         except requests.RequestException as e:
             print(f"Failed to register: {e}")
@@ -580,6 +585,12 @@ def main():
         default=0,
         help="Max CPU percentage per job (0 = unlimited)",
     )
+    parser.add_argument(
+        "--skills",
+        nargs="*",
+        default=[],
+        help="Agent skills (e.g., docker kubernetes python)",
+    )
 
     args = parser.parse_args()
 
@@ -587,6 +598,7 @@ def main():
         args.server,
         args.name,
         args.tags,
+        skills=args.skills,
         use_websocket=not args.no_ws,
         max_parallel_jobs=args.parallel_jobs,
         max_memory_mb=args.max_memory,

@@ -74,6 +74,7 @@ class Job(Base):
     working_dir = Column(String(500), nullable=True)
     matrix_vars = Column(Text, nullable=True)
     skip_condition = Column(String(500), nullable=True)
+    required_skills = Column(String(500), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)
@@ -92,10 +93,25 @@ class Agent(Base):
     ip_address = Column(String(50), nullable=False)
     status = Column(SQLEnum(AgentStatus), default=AgentStatus.IDLE)
     tags = Column(String(500), nullable=True)
+    skills = Column(Text, nullable=True)
     registered_at = Column(DateTime, default=datetime.utcnow)
     last_seen = Column(DateTime, nullable=True)
 
     jobs = relationship("Job", back_populates="agent")
+    agent_skills = relationship("AgentSkill", back_populates="agent", cascade="all, delete-orphan")
+
+
+class AgentSkill(Base):
+    __tablename__ = "agent_skills"
+
+    id = Column(Integer, primary_key=True)
+    agent_id = Column(Integer, ForeignKey("agents.id"), nullable=False)
+    name = Column(String(100), nullable=False)
+    level = Column(Integer, default=1)
+    enabled = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    agent = relationship("Agent", back_populates="agent_skills")
 
 
 class JobLog(Base):
@@ -164,6 +180,7 @@ class AgentCreate(BaseModel):
     name: str
     hostname: str
     tags: Optional[list[str]] = []
+    skills: Optional[list[str]] = []
 
 
 class AgentResponse(BaseModel):
@@ -173,6 +190,7 @@ class AgentResponse(BaseModel):
     ip_address: str
     status: AgentStatus
     tags: Optional[list[str]]
+    skills: Optional[list[str]] = []
     registered_at: datetime
     last_seen: Optional[datetime]
 
@@ -229,6 +247,24 @@ class WebhookResponse(BaseModel):
     is_active: bool
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class AgentSkillCreate(BaseModel):
+    name: str
+    level: int = 1
+
+
+class AgentSkillResponse(BaseModel):
+    id: int
+    name: str
+    level: int
+    enabled: bool
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class AgentSkillsUpdate(BaseModel):
+    skills: list[AgentSkillCreate]
 
 
 # Pydantic models for artifacts

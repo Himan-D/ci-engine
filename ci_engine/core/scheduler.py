@@ -3,7 +3,15 @@
 
 from typing import Optional
 from datetime import datetime
-from ci_engine.server.models import Job, Agent, JobStatus, AgentStatus, Build, BuildStatus
+from ci_engine.server.models import (
+    Job,
+    Agent,
+    AgentSkill,
+    JobStatus,
+    AgentStatus,
+    Build,
+    BuildStatus,
+)
 
 
 class Scheduler:
@@ -32,13 +40,39 @@ class Scheduler:
         return query.first()
 
     @staticmethod
-    def find_best_agent_by_priority(db, job_id: int) -> Optional[Agent]:
-        """Find best available agent for a job with priority matching."""
+    def find_agent_with_skills(db, required_skills: list[str]) -> Optional[Agent]:
+        """Find an available agent that has all required skills."""
+        if not required_skills:
+            return Scheduler.find_available_agent(db, None)
+
+        skill_names = [s.strip() for s in required_skills]
+
+        idle_agents = db.query(Agent).filter(Agent.status == AgentStatus.IDLE).all()
+
+        for agent in idle_agents:
+            agent_skill_names = [s.name for s in agent.agent_skills if s.enabled]
+            if all(skill in agent_skill_names for skill in skill_names):
+                return agent
+
+        return None
+
+    @staticmethod
+    def find_best_agent(db, job_id: int) -> Optional[Agent]:
+        """Find best available agent for a job based on tags and skills."""
         job = db.query(Job).filter(Job.id == job_id).first()
         if not job:
             return None
-        required = job.required_tags if job.required_tags else None
-        return Scheduler.find_available_agent(db, required)
+
+        if job.required_skills:
+            required_skills_list = [s.strip() for s in job.required_skills.split(",")]
+            agent = Scheduler.find_agent_with_skills(db, required_skills_list)
+            if agent:
+                return agent
+
+        if job.required_tags:
+            return Scheduler.find_available_agent(db, job.required_tags)
+
+        return Scheduler.find_available_agent(db, None)
 
     @staticmethod
     def assign_job(db, job_id: int, agent_id: int) -> bool:

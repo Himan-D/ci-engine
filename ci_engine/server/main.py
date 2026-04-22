@@ -25,6 +25,7 @@ from ci_engine.server.models import (
     AgentStatus,
     AgentCreate,
     AgentResponse,
+    AgentSkill,
     JobLog,
     WebhookConfig,
     WebhookCreate,
@@ -323,6 +324,10 @@ def register_agent(agent_data: AgentCreate, db: Session = Depends(get_db)):
     if existing:
         existing.status = AgentStatus.IDLE
         existing.last_seen = datetime.utcnow()
+        if agent_data.tags:
+            existing.tags = ",".join(agent_data.tags)
+        if agent_data.skills:
+            existing.skills = ",".join(agent_data.skills)
         db.commit()
         db.refresh(existing)
         return existing
@@ -332,11 +337,18 @@ def register_agent(agent_data: AgentCreate, db: Session = Depends(get_db)):
         hostname=agent_data.hostname,
         ip_address="0.0.0.0",
         status=AgentStatus.IDLE,
-        tags=",".join(agent_data.tags) if agent_data.tags else "",
+        tags=",".join(agent_data.tags) if agent_data.tags else None,
+        skills=",".join(agent_data.skills) if agent_data.skills else None,
     )
     db.add(agent)
     db.commit()
     db.refresh(agent)
+
+    for skill_name in agent_data.skills or []:
+        skill = AgentSkill(agent_id=agent.id, name=skill_name, level=1)
+        db.add(skill)
+    db.commit()
+
     return agent
 
 
