@@ -235,3 +235,69 @@ Co-authored-by: Claude <noreply@anthropic.com>
 3. ✅ Types correct: (no type errors)
 4. ✅ Documentation updated if needed
 5. ✅ Commit message has Co-authored-by
+
+## 10. Safety Checks Before Pushing
+
+Always run these safety checks before pushing to GitHub:
+
+```bash
+# 1. Run full test suite
+pytest tests/ -v
+
+# 2. Verify imports work
+python -c "from ci_engine.server.main import app"
+python -c "from ci_engine.agent.agent import Agent"
+
+# 3. Verify Docker build (optional but recommended)
+docker build -f Dockerfile.server -t ci-engine:test .
+```
+
+## 11. Always Push After Work
+
+**Always push code to GitHub after completing work:**
+
+```bash
+# Stage changes
+git add ci_engine/ tests/ pyproject.toml *.md
+
+# Commit with descriptive message
+git commit -m "Add <feature_name>
+
+Description of what was added.
+
+Tests:
+- Unit tests for X
+- Integration tests for Y
+
+Co-authored-by: Claude <noreply@anthropic.com>"
+
+# Push to GitHub
+git push origin master
+```
+
+## 12. End-to-End Testing
+
+Run these tests after making agent or server changes:
+
+```bash
+# Test 1: Agent imports correctly
+python -c "from ci_engine.agent.agent import Agent; print('Agent OK')"
+
+# Test 2: Server starts
+timeout 5 uvicorn ci_engine.server.main:app --host 127.0.0.1 --port 8765 &
+sleep 2
+curl -f http://127.0.0.1:8765/health || echo "Server failed"
+
+# Test 3: Agent can register (if server running)
+python -m ci_engine.agent.agent --name test-e2e-agent --server http://127.0.0.1:8765 &
+sleep 2
+pkill -f "uvicorn ci_engine" || true
+
+# Test 4: Verify parallel execution capability
+python -c "
+from ci_engine.agent.agent import Agent
+a = Agent('http://localhost:8000', 'test', max_parallel_jobs=4)
+print(f'Parallel jobs: {a.max_parallel_jobs}')
+print('OK')
+"
+```
