@@ -48,6 +48,7 @@ class Agent:
         workspace_prefix: str = "/tmp/ci-engine-workspace",
         max_memory_mb: int = 0,
         max_cpu_percent: int = 0,
+        version: str = "1.0.0",
     ):
         self.server_url = server_url.rstrip("/")
         self.name = name
@@ -55,6 +56,7 @@ class Agent:
         self.max_cpu_percent = max_cpu_percent
         self.tags = tags or []
         self.skills = skills or []
+        self.version = version
         self.agent_id: Optional[int] = None
         self.use_websocket = use_websocket
         self.max_parallel_jobs = max_parallel_jobs
@@ -77,12 +79,13 @@ class Agent:
                     "hostname": self._get_hostname(),
                     "tags": self.tags,
                     "skills": self.skills,
+                    "version": self.version,
                 },
                 timeout=10,
             )
             if response.status_code == 200:
                 self.agent_id = response.json().get("id")
-                print(f"Registered as agent #{self.agent_id}")
+                print(f"Registered as agent #{self.agent_id} (version {self.version})")
                 if self.skills:
                     print(f"Registered skills: {', '.join(self.skills)}")
                 return True

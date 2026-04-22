@@ -26,6 +26,12 @@ from ci_engine.server.models import (
     AgentCreate,
     AgentResponse,
     AgentSkill,
+    AgentPool,
+    AgentPoolCreate,
+    AgentPoolResponse,
+    AgentLabel,
+    AgentLabelCreate,
+    AgentLabelResponse,
     JobLog,
     WebhookConfig,
     WebhookCreate,
@@ -630,6 +636,184 @@ def auto_detect_agent_skills(agent_id: int, db: Session = Depends(get_db)):
     return {
         "message": f"Auto-detected {len(detected['skills'])} skills",
         "detected": detected["summary"],
+    }
+
+
+# Agent Pool endpoints
+@app.post("/api/agent-pools", response_model=AgentPoolResponse)
+def create_agent_pool(pool_data: AgentPoolCreate, db: Session = Depends(get_db)):
+    """Create a new agent pool."""
+    existing = db.query(AgentPool).filter(AgentPool.name == pool_data.name).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Pool already exists")
+
+    pool = AgentPool(
+        name=pool_data.name,
+        description=pool_data.description,
+        max_agents=pool_data.max_agents,
+        min_agents=pool_data.min_agents,
+        scaling_enabled=pool_data.scaling_enabled,
+    )
+    db.add(pool)
+    db.commit()
+    db.refresh(pool)
+    return pool
+
+
+@app.get("/api/agent-pools", response_model=list[AgentPoolResponse])
+def list_agent_pools(db: Session = Depends(get_db)):
+    """List all agent pools."""
+    pools = db.query(AgentPool).all()
+    result = []
+    for pool in pools:
+        agent_count = db.query(Agent).filter(Agent.pool_id == pool.id).count()
+        response = AgentPoolResponse(
+            id=pool.id,
+            name=pool.name,
+            description=pool.description,
+            max_agents=pool.max_agents,
+            min_agents=pool.min_agents,
+            scaling_enabled=pool.scaling_enabled,
+            agent_count=agent_count,
+        )
+        result.append(response)
+    return result
+
+
+@app.get("/api/agent-pools/{pool_id}", response_model=AgentPoolResponse)
+def get_agent_pool(pool_id: int, db: Session = Depends(get_db)):
+    """Get a specific agent pool."""
+    pool = db.query(AgentPool).filter(AgentPool.id == pool_id).first()
+    if not pool:
+        raise HTTPException(status_code=404, detail="Pool not found")
+
+    agent_count = db.query(Agent).filter(Agent.pool_id == pool.id).count()
+    return AgentPoolResponse(
+        id=pool.id,
+        name=pool.name,
+        description=pool.description,
+        max_agents=pool.max_agents,
+        min_agents=pool.min_agents,
+        scaling_enabled=pool.scaling_enabled,
+        agent_count=agent_count,
+    )
+
+
+@app.delete("/api/agent-pools/{pool_id}")
+def delete_agent_pool(pool_id: int, db: Session = Depends(get_db)):
+    """Delete an agent pool."""
+    pool = db.query(AgentPool).filter(AgentPool.id == pool_id).first()
+    if not pool:
+        raise HTTPException(status_code=404, detail="Pool not found")
+
+    db.query(Agent).filter(Agent.pool_id == pool_id).update({Agent.pool_id: None})
+    db.delete(pool)
+    db.commit()
+    return {"message": "Pool deleted"}
+
+
+# Agent Labels endpoints
+@app.get("/api/agents/{agent_id}/labels")
+def get_agent_labels(agent_id: int, db: Session = Depends(get_db)):
+    """Get all labels for an agent."""
+    agent = db.query(Agent).filter(Agent.id == agent_id).first()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    from ci_engine.server.models import AgentLabel
+
+    labels = db.query(AgentLabel).filter(AgentLabel.agent_id == agent_id).all()
+    return [{"id": l.id, "key": l.key, "value": l.value} for l in labels]
+
+
+@app.post("/api/agents/{agent_id}/labels")
+def add_agent_label(agent_id: int, label: AgentLabelCreate, db: Session = Depends(get_db)):
+    """Add a label to an agent."""
+    agent = db.query(Agent).filter(Agent.id == agent_id).first()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    from ci_engine.server.models import AgentLabel
+
+    existing = (
+        db.query(AgentLabel)
+        .filter(AgentLabel.agent_id == agent_id, AgentLabel.key == label.key)
+        .first()
+    )
+
+    if existing:
+        existing.value = label.value
+        db.commit()
+        return existing
+
+    new_label = AgentLabel(agent_id=agent_id, key=label.key, value=label.value)
+    db.add(new_label)
+    db.commit()
+    db.refresh(new_label)
+    return new_label
+
+
+@app.delete("/api/agents/{agent_id}/labels/{label_key}")
+def delete_agent_label(agent_id: int, label_key: str, db: Session = Depends(get_db)):
+    """Delete a label from an agent."""
+    from ci_engine.server.models import AgentLabel
+
+    label = (
+        db.query(AgentLabel)
+        .filter(AgentLabel.agent_id == agent_id, AgentLabel.key == label_key)
+        .first()
+    )
+
+    if not label:
+        raise HTTPException(status_code=404, detail="Label not found")
+
+    db.delete(label)
+    db.commit()
+    return {"message": "Label deleted"}
+
+
+# Agent Drain Mode
+@app.post("/api/agents/{agent_id}/drain")
+def drain_agent(agent_id: int, db: Session = Depends(get_db)):
+    """Put agent in drain mode - stop accepting new jobs."""
+    agent = db.query(Agent).filter(Agent.id == agent_id).first()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    agent.drain_mode = True
+    if agent.status == AgentStatus.IDLE:
+        agent.status = AgentStatus.OFFLINE
+    db.commit()
+    return {"message": "Agent now in drain mode", "drain_mode": True}
+
+
+@app.post("/api/agents/{agent_id}/undrain")
+def undrain_agent(agent_id: int, db: Session = Depends(get_db)):
+    """Remove agent from drain mode."""
+    agent = db.query(Agent).filter(Agent.id == agent_id).first()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    agent.drain_mode = False
+    if agent.status == AgentStatus.OFFLINE:
+        agent.status = AgentStatus.IDLE
+    db.commit()
+    return {"message": "Agent removed from drain mode", "drain_mode": False}
+
+
+# Agent Upgrade
+@app.post("/api/agents/{agent_id}/upgrade")
+def upgrade_agent(agent_id: int, db: Session = Depends(get_db)):
+    """Trigger agent upgrade."""
+    agent = db.query(Agent).filter(Agent.id == agent_id).first()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    return {
+        "message": "Upgrade triggered",
+        "agent_id": agent_id,
+        "current_version": agent.version,
+        "upgrade_url": os.environ.get("AGENT_UPGRADE_URL", ""),
     }
 
 

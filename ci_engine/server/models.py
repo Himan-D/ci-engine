@@ -95,11 +95,39 @@ class Agent(Base):
     status = Column(SQLEnum(AgentStatus), default=AgentStatus.IDLE)
     tags = Column(String(500), nullable=True)
     skills = Column(Text, nullable=True)
+    pool_id = Column(Integer, ForeignKey("agent_pools.id"), nullable=True)
+    version = Column(String(50), nullable=True)
+    drain_mode = Column(Boolean, default=False)
     registered_at = Column(DateTime, default=datetime.utcnow)
     last_seen = Column(DateTime, nullable=True)
 
     jobs = relationship("Job", back_populates="agent")
     agent_skills = relationship("AgentSkill", back_populates="agent", cascade="all, delete-orphan")
+    pool = relationship("AgentPool", back_populates="agents")
+
+
+class AgentPool(Base):
+    __tablename__ = "agent_pools"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(100), unique=True, nullable=False)
+    description = Column(String(500), nullable=True)
+    max_agents = Column(Integer, default=0)
+    min_agents = Column(Integer, default=0)
+    scaling_enabled = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    agents = relationship("Agent", back_populates="pool")
+
+
+class AgentLabel(Base):
+    __tablename__ = "agent_labels"
+
+    id = Column(Integer, primary_key=True)
+    agent_id = Column(Integer, ForeignKey("agents.id"), nullable=False)
+    key = Column(String(100), nullable=False)
+    value = Column(String(200), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 
 class AgentSkill(Base):
@@ -201,6 +229,7 @@ class AgentCreate(BaseModel):
     hostname: str
     tags: Optional[list[str]] = []
     skills: Optional[list[str]] = []
+    pool_id: Optional[int] = None
 
 
 class AgentResponse(BaseModel):
@@ -211,8 +240,44 @@ class AgentResponse(BaseModel):
     status: AgentStatus
     tags: Optional[list[str]]
     skills: Optional[list[str]] = []
+    pool_id: Optional[int] = None
+    drain_mode: bool = False
     registered_at: datetime
     last_seen: Optional[datetime]
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class AgentPoolCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+    max_agents: int = 0
+    min_agents: int = 0
+    scaling_enabled: bool = False
+
+
+class AgentPoolResponse(BaseModel):
+    id: int
+    name: str
+    description: Optional[str]
+    max_agents: int
+    min_agents: int
+    scaling_enabled: bool
+    agent_count: int = 0
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class AgentLabelCreate(BaseModel):
+    key: str
+    value: str
+
+
+class AgentLabelResponse(BaseModel):
+    id: int
+    key: str
+    value: str
+    created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
 
