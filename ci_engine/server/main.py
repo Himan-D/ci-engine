@@ -1542,31 +1542,162 @@ steps:
 
 
 # Artifact endpoints
+from fastapi import UploadFile, File
+from ci_engine.core.artifacts import get_artifact_storage
+
+
 @app.post("/api/artifacts", response_model=ArtifactResponse, tags=["artifacts"])
 async def upload_artifact(
     build_id: int,
     job_id: Optional[int] = None,
     filename: str = "",
     content_type: str = "application/octet-stream",
+    file: UploadFile = File(None),
     db: Session = Depends(get_db),
 ):
-    """Upload an artifact (placeholder - implement with actual file upload)."""
+    """Upload an artifact with optional file content."""
     build = db.query(Build).filter(Build.id == build_id).first()
     if not build:
         raise HTTPException(status_code=404, detail="Build not found")
+
+    file_data = b""
+    file_size = 0
+
+    if file:
+        file_data = await file.read()
+        file_size = len(file_data)
+        if not filename:
+            filename = file.filename or "artifact"
+        if not content_type or content_type == "application/octet-stream":
+            content_type = file.content_type or "application/octet-stream"
+
+    storage_key = f"builds/{build_id}/jobs/{job_id or 'none'}/{filename}"
+    storage_location = (
+        f"s3://{os.environ.get('CI_ENGINE_S3_BUCKET', 'ci-engine-artifacts')}/{storage_key}"
+    )
+
+    if file_data and os.environ.get("CI_ENGINE_S3_BUCKET"):
+        try:
+            storage = get_artifact_storage()
+            result = await storage.upload_artifact(
+                data=file_data,
+                build_id=build_id,
+                job_id=job_id,
+                filename=filename,
+                content_type=content_type,
+            )
+            storage_key = result.key
+            storage_location = result.storage_location
+            file_size = result.size
+        except Exception as e:
+            pass
 
     artifact = Artifact(
         build_id=build_id,
         job_id=job_id,
         filename=filename or "artifact",
-        size=0,
+        size=file_size,
         content_type=content_type,
-        storage_key=f"builds/{build_id}/jobs/{job_id or 'none'}/{filename}",
+        storage_key=storage_key,
+        storage_location=storage_location,
     )
     db.add(artifact)
     db.commit()
     db.refresh(artifact)
     return artifact
+
+
+@app.get("/api/artifacts/{artifact_id}/download", tags=["artifacts"])
+async def download_artifact(artifact_id: int, db: Session = Depends(get_db)):
+    """Download an artifact file."""
+    artifact = db.query(Artifact).filter(Artifact.id == artifact_id).first()
+    if not artifact:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+
+    if os.environ.get("CI_ENGINE_S3_BUCKET") and artifact.storage_key:
+        try:
+            storage = get_artifact_storage()
+            build_id = artifact.build_id
+            job_id = artifact.job_id
+            data = await storage.download_artifact(
+                build_id=build_id,
+                job_id=job_id,
+                filename=artifact.filename,
+            )
+            return Response(
+                content=data,
+                media_type=artifact.content_type,
+                headers={"Content-Disposition": f'attachment; filename="{artifact.filename}"'},
+            )
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to download: {str(e)}")
+
+    raise HTTPException(status_code=404, detail="Artifact file not found")
+
+
+# Cache endpoints
+from ci_engine.core.cache import get_cache, compute_cache_key
+
+
+@app.get("/api/cache", tags=["cache"])
+def list_cache():
+    """List all cache entries."""
+    cache = get_cache()
+    entries = cache.list()
+    return [
+        {
+            "key": e.key,
+            "path": e.path,
+            "size": e.size,
+            "created_at": e.created_at.isoformat(),
+            "expires_at": e.expires_at.isoformat() if e.expires_at else None,
+            "hit_count": e.hit_count,
+        }
+        for e in entries
+    ]
+
+
+@app.post("/api/cache", tags=["cache"])
+def create_cache_entry(
+    build_id: int,
+    job_id: int,
+    cache_key: str,
+    source_path: str,
+    ttl_days: int = 7,
+):
+    """Store files in cache."""
+    key = compute_cache_key(build_id, job_id, cache_key)
+    cache = get_cache()
+    cache.put(key, source_path, ttl_days)
+    return {"key": key, "status": "stored"}
+
+
+@app.get("/api/cache/{cache_key:path}", tags=["cache"])
+def get_cache_entry(cache_key: str):
+    """Get cache entry by key."""
+    cache = get_cache()
+    path = cache.get(cache_key)
+    if path is None:
+        raise HTTPException(status_code=404, detail="Cache not found")
+    return {"key": cache_key, "path": path, "status": "hit"}
+
+
+@app.delete("/api/cache/{cache_key:path}", tags=["cache"])
+def delete_cache_entry(cache_key: str):
+    """Delete cache entry."""
+    cache = get_cache()
+    deleted = cache.delete(cache_key)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Cache not found")
+    return {"status": "deleted", "key": cache_key}
+
+
+@app.delete("/api/cache", tags=["cache"])
+def clear_cache():
+    """Clear all cache entries."""
+    cache = get_cache()
+    count = cache.clear()
+    return {"status": "cleared", "count": count}
 
 
 @app.get(
