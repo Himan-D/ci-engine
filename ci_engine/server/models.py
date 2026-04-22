@@ -75,6 +75,7 @@ class Job(Base):
     matrix_vars = Column(Text, nullable=True)
     skip_condition = Column(String(500), nullable=True)
     required_skills = Column(String(500), nullable=True)
+    depends_on = Column(String(500), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)

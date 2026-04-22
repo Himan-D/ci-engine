@@ -693,6 +693,10 @@ def complete_job(job_id: int, exit_code: int, db: Session = Depends(get_db)):
     if job.agent:
         job.agent.status = AgentStatus.IDLE
 
+    db.commit()
+
+    Scheduler.check_and_update_dependencies(db, job.build_id)
+
     retry_triggered = False
 
     if job.status == JobStatus.FAILED and job.max_retries > 0:
@@ -747,6 +751,59 @@ def complete_job(job_id: int, exit_code: int, db: Session = Depends(get_db)):
         }
 
     return {"status": "completed", "exit_code": exit_code}
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+def cancel_job(job_id: int, db: Session = Depends(get_db)):
+    """Cancel a running or pending job."""
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if job.status in (JobStatus.PASSED, JobStatus.FAILED, JobStatus.CANCELED, JobStatus.SKIPPED):
+        raise HTTPException(status_code=400, detail=f"Job already {job.status.value}")
+
+    job.status = JobStatus.CANCELED
+    job.finished_at = datetime.utcnow()
+
+    if job.agent:
+        job.agent.status = AgentStatus.IDLE
+
+    db.commit()
+
+    Scheduler.check_and_update_dependencies(db, job.build_id)
+
+    return {"status": "canceled", "job_id": job_id}
+
+
+@app.post("/api/builds/{build_id}/cancel")
+def cancel_build(build_id: int, db: Session = Depends(get_db)):
+    """Cancel all running and pending jobs in a build."""
+    build = db.query(Build).filter(Build.id == build_id).first()
+    if not build:
+        raise HTTPException(status_code=404, detail="Build not found")
+
+    jobs = db.query(Job).filter(Job.build_id == build_id).all()
+    canceled_count = 0
+
+    for job in jobs:
+        if job.status in (JobStatus.PENDING, JobStatus.RUNNING, JobStatus.ASSIGNED):
+            job.status = JobStatus.CANCELED
+            job.finished_at = datetime.utcnow()
+            if job.agent:
+                job.agent.status = AgentStatus.IDLE
+            canceled_count += 1
+
+    build.status = BuildStatus.CANCELED
+    build.finished_at = datetime.utcnow()
+
+    db.commit()
+
+    return {
+        "status": "canceled",
+        "build_id": build_id,
+        "jobs_canceled": canceled_count,
+    }
 
 
 @app.post("/api/jobs/{job_id}/log")

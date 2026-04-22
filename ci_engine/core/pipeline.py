@@ -183,6 +183,15 @@ def _normalize_step(step: dict[str, Any], step_type: str) -> dict[str, Any]:
     """Normalize a step to have consistent structure."""
     normalized = dict(step)
 
+    depends_on = step.get("depends_on")
+    if depends_on:
+        if isinstance(depends_on, str):
+            normalized["depends_on"] = [depends_on]
+        elif isinstance(depends_on, list):
+            normalized["depends_on"] = depends_on
+        else:
+            normalized["depends_on"] = []
+
     if step_type == StepType.WAIT:
         normalized["step_type"] = StepType.WAIT
         normalized["label"] = step.get("wait") or "Wait"

@@ -294,6 +294,20 @@ class Agent:
         except requests.RequestException:
             pass
 
+    def _check_job_cancelled(self, job_id: int) -> bool:
+        """Check if job has been cancelled."""
+        try:
+            response = requests.get(
+                f"{self.server_url}/api/jobs/{job_id}",
+                timeout=5,
+            )
+            if response.status_code == 200:
+                job = response.json()
+                return job.get("status") == "canceled"
+        except requests.RequestException:
+            pass
+        return False
+
     def complete_job(self, job_id: int, exit_code: int):
         """Mark job as completed."""
         try:
@@ -415,6 +429,19 @@ class Agent:
         while self._resource_monitor_running:
             for job_id, running in list(self._running_jobs.items()):
                 if not running.future.done():
+                    if self._check_job_cancelled(job_id):
+                        print(f"Job {job_id} cancelled - initiating graceful shutdown")
+                        try:
+                            process = psutil.Process(running.future.result().pid)
+                            process.terminate()
+                            try:
+                                process.wait(timeout=5)
+                            except psutil.TimeoutExpired:
+                                process.kill()
+                        except Exception:
+                            pass
+                        continue
+
                     try:
                         process = psutil.Process(running.future.result().pid)
                         mem_mb = process.memory_info().rss / 1024 / 1024
@@ -534,6 +561,10 @@ class Agent:
                     env=env_vars if env_vars else None,
                     timeout=timeout_seconds,
                 )
+
+            if self._check_job_cancelled(job_id):
+                send_log("stderr", "Job cancelled by user")
+                return -1
 
             if stdout:
                 send_log("stdout", stdout)

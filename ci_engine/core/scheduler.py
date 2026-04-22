@@ -91,6 +91,82 @@ class Scheduler:
         return Scheduler.find_available_agent(db, None)
 
     @staticmethod
+    def get_runnable_jobs(db, build_id: int) -> list[Job]:
+        """Get jobs that can run - dependencies satisfied and ready."""
+        jobs = db.query(Job).filter(Job.build_id == build_id).all()
+
+        job_by_label = {job.label: job for job in jobs}
+        job_by_index = {job.step_index: job for job in jobs}
+
+        runnable = []
+
+        for job in jobs:
+            if job.status not in (JobStatus.PENDING, JobStatus.BLOCKED):
+                continue
+
+            depends_on = job.depends_on
+            if not depends_on:
+                runnable.append(job)
+                continue
+
+            deps = [d.strip() for d in depends_on.split(",") if d.strip()]
+            can_run = True
+
+            for dep in deps:
+                dep_job = None
+
+                if dep.isdigit():
+                    dep_idx = int(dep)
+                    dep_job = job_by_index.get(dep_idx)
+                else:
+                    dep_job = job_by_label.get(dep)
+
+                if dep_job is None:
+                    continue
+
+                if dep_job.status not in (JobStatus.PASSED, JobStatus.SKIPPED):
+                    can_run = False
+                    break
+
+            if can_run:
+                if job.status == JobStatus.BLOCKED:
+                    job.status = JobStatus.PENDING
+                runnable.append(job)
+
+        runnable.sort(key=lambda j: (-j.priority, j.step_index))
+        return runnable
+
+    @staticmethod
+    def check_and_update_dependencies(db, build_id: int):
+        """Check failed jobs and skip their dependents."""
+        jobs = db.query(Job).filter(Job.build_id == build_id).all()
+        job_by_label = {job.label: job for job in jobs}
+
+        for job in jobs:
+            if job.status != JobStatus.FAILED:
+                continue
+
+            depends_on = job.depends_on
+            if not depends_on:
+                continue
+
+            for dep in depends_on.split(","):
+                dep = dep.strip()
+                if not dep:
+                    continue
+
+                for j in jobs:
+                    if not j.depends_on:
+                        continue
+                    if dep in j.depends_on.split(","):
+                        if j.status == JobStatus.BLOCKED:
+                            j.status = JobStatus.SKIPPED
+                            j.finished_at = datetime.utcnow()
+
+        db.commit()
+        Scheduler.update_build_status(db, build_id)
+
+    @staticmethod
     def assign_job(db, job_id: int, agent_id: int) -> bool:
         """Assign a job to an agent."""
         job = db.query(Job).filter(Job.id == job_id).first()
