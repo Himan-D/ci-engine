@@ -24,7 +24,6 @@ RUN useradd -m -u 1000 ci-engine && \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /install /usr/local
-COPY --from=builder /home/ci-engine/.venv/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
 
 RUN mkdir -p /workspace /tmp/ci-engine-workspace && chown ci-engine:ci-engine /workspace /tmp/ci-engine-workspace
 
