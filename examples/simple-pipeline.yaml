@@ -1,0 +1,7 @@
+steps:
+  - label: "Build"
+    command: "echo 'Building...' && npm run build"
+  - label: "Test"
+    command: "echo 'Testing...' && npm test"
+  - label: "Deploy"
+    command: "echo 'Deploying...'"

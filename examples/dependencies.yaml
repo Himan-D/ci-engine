@@ -1,0 +1,20 @@
+name: dependency-pipeline
+
+steps:
+  - label: "Setup"
+    command: "make setup"
+    id: setup
+
+  - label: "Backend Tests"
+    command: "make test-backend"
+    depends_on: setup
+
+  - label: "Frontend Tests"
+    command: "make test-frontend"
+    depends_on: setup
+
+  - label: "Integration Tests"
+    command: "make test-integration"
+    depends_on:
+      - backend-tests
+      - frontend-tests
