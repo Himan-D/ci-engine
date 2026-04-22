@@ -236,6 +236,18 @@ def broadcast_build_status(
 @app.on_event("startup")
 def startup():
     init_db()
+    from ci_engine.core.logging import setup_logging
+
+    setup_logging(
+        level=os.environ.get("LOG_LEVEL", "INFO"),
+        json_format=os.environ.get("LOG_FORMAT", "") == "json",
+    )
+    try:
+        from ci_engine.core.tracing import init_tracing
+
+        init_tracing("ci-engine-server")
+    except ImportError:
+        pass
 
 
 app.include_router(dashboard_router)
