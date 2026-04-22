@@ -1555,6 +1555,64 @@ steps:
     return {"status": "received"}
 
 
+@app.post("/api/webhooks/gitlab", tags=["webhooks"])
+def gitlab_webhook(
+    payload: dict,
+    x_gitlab_token: Optional[str] = None,
+    x_gitlab_event: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    """Handle incoming GitLab webhooks."""
+    active_webhooks = (
+        db.query(WebhookConfig)
+        .filter(
+            WebhookConfig.is_active,
+            WebhookConfig.events.contains("gitlab"),
+        )
+        .all()
+    )
+
+    for webhook in active_webhooks:
+        if webhook.secret:
+            if not WebhookService.verify_gitlab_token(x_gitlab_token or "", webhook.secret):
+                raise HTTPException(status_code=401, detail="Invalid GitLab token")
+
+    event = WebhookService.parse_gitlab_event(payload, x_gitlab_event or "")
+    if event:
+        build_info = WebhookService.extract_build_info(event)
+        if build_info:
+            pipeline = """
+steps:
+  - label: "Build"
+    command: "make build"
+  - label: "Test"
+    command: "make test"
+"""
+            build = Build(
+                pipeline=pipeline,
+                branch=build_info.get("branch", "main"),
+                commit=build_info.get("commit"),
+                status=BuildStatus.PENDING,
+            )
+            db.add(build)
+            db.commit()
+
+            steps = parse_pipeline(pipeline)
+            for i, step in enumerate(steps):
+                job = Job(
+                    build_id=build.id,
+                    step_index=i,
+                    label=step.get("label", f"Step {i}"),
+                    command=step.get("command", ""),
+                    status=JobStatus.PENDING,
+                )
+                db.add(job)
+            db.commit()
+            return {"status": "created", "build_id": build.id}
+
+    return {"status": "received"}
+
+
 # Artifact endpoints
 from fastapi import UploadFile, File
 from ci_engine.core.artifacts import get_artifact_storage

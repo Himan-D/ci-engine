@@ -1,0 +1,140 @@
+replicaCount: 2
+
+image:
+  repository: ci-engine/server
+  tag: latest
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+rbac:
+  create: true
+
+service:
+  type: ClusterIP
+  port: 8000
+  metricsPort: 9090
+  annotations: {}
+
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+  hosts:
+    - host: ci-engine.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: ci-engine-tls
+      hosts:
+        - ci-engine.example.com
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 1Gi
+  requests:
+    cpu: 100m
+    memory: 256Mi
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
+
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 8000
+  initialDelaySeconds: 15
+  periodSeconds: 20
+
+readinessProbe:
+  httpGet:
+    path: /health
+    port: 8000
+  initialDelaySeconds: 5
+  periodSeconds: 10
+
+database:
+  host: postgres
+  port: 5432
+  name: ci_engine
+  user: ci_engine
+  existingSecret: ci-engine-secrets
+  secretKey: database-url
+
+redis:
+  host: redis
+  port: 6379
+  existingSecret: ci-engine-secrets
+  secretKey: redis-url
+
+secrets:
+  existingSecret: ci-engine-secrets
+  keys:
+    secretKey: secret-key
+    encryptionKey: encryption-key
+    fernetKey: fernet-key
+
+config:
+  logLevel: info
+  logFormat: json
+  s3Bucket: ci-engine-artifacts
+
+otel:
+  enabled: true
+  exporterEndpoint: http://otel-collector:4317
+  serviceName: ci-engine-server
+
+agents:
+  enabled: true
+  replicaCount: 3
+  image:
+    repository: ci-engine/agent
+    tag: latest
+  config:
+    serverUrl: http://ci-engine-server:8000
+    workspace: /workspace
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+
+prometheus:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+    interval: 30s
+    scrapeTimeout: 10s
+
+persistence:
+  enabled: true
+  storageClass: ""
+  accessMode: ReadWriteOnce
+  size: 10Gi
+  workspace:
+    enabled: true
+    storageClass: ""
+    size: 50Gi

@@ -1,0 +1,17 @@
+apiVersion: v2
+name: ci-engine
+description: A Buildkite alternative CI/CD platform
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - ci
+  - cd
+  - cicd
+  - buildkite
+  - github-actions
+maintainers:
+  - name: CI Engine Team
+    email: team@ci-engine.dev
+sources:
+  - https://github.com/Himan-D/ci-engine

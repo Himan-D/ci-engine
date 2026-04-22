@@ -48,6 +48,13 @@ class WebhookService:
         return hmac.compare_digest(expected, signature)
 
     @staticmethod
+    def verify_gitlab_token(token: str, secret: str) -> bool:
+        """Verify GitLab webhook token."""
+        if not token or not secret:
+            return False
+        return hmac.compare_digest(token, secret)
+
+    @staticmethod
     def parse_github_event(payload: dict, event_type: str) -> Optional[WebhookEvent]:
         """Parse GitHub webhook payload."""
         if event_type == "push":
@@ -68,6 +75,26 @@ class WebhookService:
         return None
 
     @staticmethod
+    def parse_gitlab_event(payload: dict, event_name: str) -> Optional[WebhookEvent]:
+        """Parse GitLab webhook payload."""
+        if event_name == "push hook":
+            return WebhookEvent(
+                event_type="push",
+                payload=payload,
+            )
+        elif event_name in ("merge_request_hook", "merge request hook"):
+            return WebhookEvent(
+                event_type="merge_request",
+                payload=payload,
+            )
+        elif event_name == "tag push hook":
+            return WebhookEvent(
+                event_type="tag",
+                payload=payload,
+            )
+        return None
+
+    @staticmethod
     def extract_build_info(event: WebhookEvent) -> Optional[dict]:
         """Extract build information from webhook event."""
         if event.event_type == "push":
@@ -81,25 +108,49 @@ class WebhookService:
             return {
                 "branch": ref.replace("refs/heads/", ""),
                 "commit": payload.get("after"),
-                "repository": payload.get("repository", {}).get("full_name"),
-                "pusher": payload.get("pusher", {}).get("name"),
+                "repository": payload.get("repository", {}).get("full_name")
+                or payload.get("project", {}).get("path_with_namespace"),
+                "pusher": payload.get("pusher", {}).get("name") or payload.get("user_username"),
             }
 
-        elif event.event_type == "pull_request":
+        elif event.event_type in ("pull_request", "merge_request"):
             payload = event.payload
-            action = payload.get("action")
 
-            # Only trigger on certain PR actions
-            if action not in ("opened", "synchronize", "reopened"):
-                return None
+            if event.event_type == "pull_request":
+                action = payload.get("action")
+                if action not in ("opened", "synchronize", "reopened"):
+                    return None
+                pr = payload.get("pull_request", {})
+                return {
+                    "branch": pr.get("head", {}).get("ref"),
+                    "commit": pr.get("head", {}).get("sha"),
+                    "repository": payload.get("repository", {}).get("full_name"),
+                    "pr_number": payload.get("number"),
+                    "is_pr": True,
+                }
+            else:
+                # GitLab merge request
+                attrs = payload.get("object_attributes", {})
+                action = attrs.get("action")
+                if action not in ("open", "update", "reopen"):
+                    return None
+                return {
+                    "branch": attrs.get("source_branch"),
+                    "commit": attrs.get("last_commit", {}).get("id"),
+                    "repository": payload.get("project", {}).get("path_with_namespace"),
+                    "mr_number": attrs.get("iid"),
+                    "is_mr": True,
+                }
 
-            pr = payload.get("pull_request", {})
+        elif event.event_type == "tag":
+            payload = event.payload
+            ref = payload.get("ref", "")
             return {
-                "branch": pr.get("head", {}).get("ref"),
-                "commit": pr.get("head", {}).get("sha"),
-                "repository": payload.get("repository", {}).get("full_name"),
-                "pr_number": payload.get("number"),
-                "is_pr": True,
+                "branch": ref.replace("refs/tags/", ""),
+                "commit": payload.get("after"),
+                "repository": payload.get("repository", {}).get("full_name")
+                or payload.get("project", {}).get("path_with_namespace"),
+                "is_tag": True,
             }
 
         return None
