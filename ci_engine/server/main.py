@@ -1807,3 +1807,223 @@ def reap_offline_agents(timeout_minutes: int = 5, db: Session = Depends(get_db))
     db.commit()
 
     return {"status": "reaped", "agents_marked_offline": count}
+
+
+# OIDC endpoints
+from ci_engine.server.oidc import OIDCProviderManager, OIDCTokenVerifier, OIDCTokenExchange
+
+
+@app.get("/api/oidc/config", tags=["oidc"])
+def get_oidc_config(provider: str):
+    """Get OIDC provider configuration."""
+    config = OIDCProviderManager.from_env(provider)
+    if not config:
+        raise HTTPException(status_code=404, detail="Provider not configured")
+    return {
+        "provider": config.provider.value,
+        "issuer_url": config.issuer_url,
+        "client_id": config.client_id,
+        "authorization_endpoint": f"{config.issuer_url}/authorize",
+        "token_endpoint": f"{config.issuer_url}/oauth/token",
+    }
+
+
+@app.get("/api/oidc/providers", tags=["oidc"])
+def list_oidc_providers():
+    """List all available OIDC providers."""
+    providers = OIDCProviderManager.get_all_providers()
+    return [
+        {
+            "provider": p.provider.value,
+            "issuer_url": p.issuer_url,
+            "client_id": p.client_id,
+        }
+        for p in providers
+        if p.client_id
+    ]
+
+
+@app.post("/api/oidc/verify", tags=["oidc"])
+def verify_oidc_token(provider: str, token: str):
+    """Verify an OIDC token."""
+    verifier = OIDCTokenVerifier()
+    try:
+        result = verifier.verify(token, provider)
+        return {"valid": True, "claims": result}
+    except Exception as e:
+        return {"valid": False, "error": str(e)}
+
+
+@app.post("/api/oidc/exchange", tags=["oidc"])
+def exchange_oidc_token(provider: str, token: str):
+    """Exchange OIDC token for cloud credentials."""
+    exchange = OIDCTokenExchange()
+    try:
+        if provider == "aws":
+            creds = exchange.exchange_for_aws(token)
+            return {
+                "provider": "aws",
+                "access_key": creds.get("AccessKeyId"),
+                "region": creds.get("Region"),
+            }
+        elif provider == "gcp":
+            creds = exchange.exchange_for_gcp(token)
+            return {"provider": "gcp", "access_token": creds.get("access_token")}
+        elif provider == "azure":
+            creds = exchange.exchange_for_azure(token)
+            return {"provider": "azure", "access_token": creds.get("access_token")}
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported provider")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Exchange failed: {str(e)}")
+
+
+# Audit log endpoints
+from ci_engine.core.audit import AuditEntry, AuditLogResponse, AuditAction
+
+
+@app.get("/api/audit-logs", response_model=list[AuditLogResponse], tags=["audit"])
+def list_audit_logs(
+    action: Optional[str] = None,
+    user_id: Optional[int] = None,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+):
+    """List audit log entries."""
+    query = db.query(AuditEntry).order_by(AuditEntry.timestamp.desc())
+
+    if action:
+        query = query.filter(AuditEntry.action == action)
+    if user_id:
+        query = query.filter(AuditEntry.user_id == user_id)
+
+    return query.limit(limit).all()
+
+
+@app.get("/api/audit-logs/{entry_id}", response_model=AuditLogResponse, tags=["audit"])
+def get_audit_log(entry_id: int, db: Session = Depends(get_db)):
+    """Get a specific audit log entry."""
+    entry = db.query(AuditEntry).filter(AuditEntry.id == entry_id).first()
+    if not entry:
+        raise HTTPException(status_code=404, detail="Audit log entry not found")
+    return entry
+
+
+@app.get("/api/audit-logs/actions", tags=["audit"])
+def list_audit_actions():
+    """List all available audit action types."""
+    return [action.value for action in AuditAction]
+
+
+# Secrets management endpoints
+from ci_engine.core.secrets import Secret, SecretCreate, SecretResponse
+
+
+@app.get("/api/secrets", response_model=list[SecretResponse], tags=["secrets"])
+def list_secrets(db: Session = Depends(get_db)):
+    """List all secrets (without values)."""
+    secrets = db.query(Secret).filter(Secret.is_active == True).all()
+    return secrets
+
+
+@app.post("/api/secrets", response_model=SecretResponse, tags=["secrets"])
+def create_secret(secret_data: SecretCreate, db: Session = Depends(get_db)):
+    """Create a new secret."""
+    from ci_engine.core.secrets import _encrypt_value
+
+    existing = db.query(Secret).filter(Secret.name == secret_data.name).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Secret already exists")
+
+    encrypted, version = _encrypt_value(secret_data.value)
+
+    secret = Secret(
+        name=secret_data.name,
+        value_encrypted=encrypted,
+        key_version=version,
+        created_by=secret_data.created_by,
+    )
+    db.add(secret)
+    db.commit()
+    db.refresh(secret)
+
+    return secret
+
+
+@app.get("/api/secrets/{secret_id}", response_model=SecretResponse, tags=["secrets"])
+def get_secret(secret_id: int, db: Session = Depends(get_db)):
+    """Get secret metadata (not the value)."""
+    secret = db.query(Secret).filter(Secret.id == secret_id).first()
+    if not secret:
+        raise HTTPException(status_code=404, detail="Secret not found")
+    return secret
+
+
+@app.put("/api/secrets/{secret_id}", response_model=SecretResponse, tags=["secrets"])
+def update_secret(secret_id: int, value: str, db: Session = Depends(get_db)):
+    """Update a secret value."""
+    from ci_engine.core.secrets import _encrypt_value
+
+    secret = db.query(Secret).filter(Secret.id == secret_id).first()
+    if not secret:
+        raise HTTPException(status_code=404, detail="Secret not found")
+
+    encrypted, version = _encrypt_value(value)
+    secret.value_encrypted = encrypted
+    secret.key_version = version
+
+    db.commit()
+    db.refresh(secret)
+
+    return secret
+
+
+@app.delete("/api/secrets/{secret_id}", tags=["secrets"])
+def delete_secret(secret_id: int, db: Session = Depends(get_db)):
+    """Delete a secret (soft delete)."""
+    secret = db.query(Secret).filter(Secret.id == secret_id).first()
+    if not secret:
+        raise HTTPException(status_code=404, detail="Secret not found")
+
+    secret.is_active = False
+    db.commit()
+
+    return {"status": "deleted", "secret_id": secret_id}
+
+
+@app.post("/api/secrets/{secret_id}/rotate", response_model=SecretResponse, tags=["secrets"])
+def rotate_secret(secret_id: int, new_value: str, db: Session = Depends(get_db)):
+    """Rotate a secret with a new value."""
+    from ci_engine.core.secrets import _encrypt_value
+
+    secret = db.query(Secret).filter(Secret.id == secret_id).first()
+    if not secret:
+        raise HTTPException(status_code=404, detail="Secret not found")
+
+    encrypted, version = _encrypt_value(new_value)
+    secret.value_encrypted = encrypted
+    secret.key_version = version + 1
+    secret.updated_at = datetime.utcnow()
+
+    db.commit()
+    db.refresh(secret)
+
+    return secret
+
+
+@app.get("/api/secrets/{secret_id}/value", tags=["secrets"])
+def get_secret_value(secret_id: int, db: Session = Depends(get_db)):
+    """Get decrypted secret value (requires elevated permissions)."""
+    from ci_engine.core.secrets import _decrypt_value
+
+    secret = db.query(Secret).filter(Secret.id == secret_id).first()
+    if not secret:
+        raise HTTPException(status_code=404, detail="Secret not found")
+    if not secret.is_active:
+        raise HTTPException(status_code=400, detail="Secret is inactive")
+
+    try:
+        value = _decrypt_value(secret.value_encrypted, secret.key_version)
+        return {"value": value}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to decrypt: {str(e)}")
