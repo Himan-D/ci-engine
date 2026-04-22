@@ -14,6 +14,64 @@ class StepType:
     WAIT = "wait"
     BLOCK = "block"
     TRIGGER = "trigger"
+    WORKFLOW = "workflow"
+
+
+class ReusableWorkflow:
+    """Reusable workflow definition."""
+
+    def __init__(
+        self,
+        name: str,
+        steps: list[dict[str, Any]],
+        env: dict[str, str] | None = None,
+        inputs: dict[str, Any] | None = None,
+    ):
+        self.name = name
+        self.steps = steps
+        self.env = env or {}
+        self.inputs = inputs or {}
+
+    def instantiate(self, params: dict[str, Any]) -> list[dict[str, Any]]:
+        """Create steps with provided parameters."""
+        result = []
+        for step in self.steps:
+            new_step = dict(step)
+            for key, value in params.items():
+                new_step = _expand_step_variables(new_step, key, value)
+            result.append(new_step)
+        return result
+
+
+_workflow_registry: dict[str, ReusableWorkflow] = {}
+
+
+def register_workflow(workflow: ReusableWorkflow):
+    """Register a reusable workflow."""
+    _workflow_registry[workflow.name] = workflow
+
+
+def get_workflow(name: str) -> ReusableWorkflow | None:
+    """Get a registered workflow by name."""
+    return _workflow_registry.get(name)
+
+
+def parse_workflow(pipeline: str) -> ReusableWorkflow | None:
+    """Parse a reusable workflow definition."""
+    try:
+        data = yaml.safe_load(pipeline)
+    except yaml.YAMLError:
+        return None
+
+    if not data:
+        return None
+
+    name = data.get("name", "unnamed")
+    steps = data.get("steps", [])
+    env = data.get("env", {})
+    inputs = data.get("inputs", {})
+
+    return ReusableWorkflow(name=name, steps=steps, env=env, inputs=inputs)
 
 
 def parse_pipeline(pipeline: str) -> list[dict[str, Any]]:
@@ -174,6 +232,18 @@ def _evaluate_conditionals(
             skipped = dict(step)
             skipped["skip_condition"] = condition
             result.append(skipped)
+
+    return result
+
+
+def _expand_step_variables(step: dict[str, Any], key: str, value: Any) -> dict[str, Any]:
+    """Expand ${{ inputs.key }} in step fields."""
+    result = dict(step)
+    pattern = f"${{{{ inputs.{key}}}}}"
+
+    for field in ["label", "command", "working_directory"]:
+        if field in result and isinstance(result[field], str):
+            result[field] = result[field].replace(pattern, str(value))
 
     return result
 

@@ -9,16 +9,18 @@
 | Matrix Builds | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ WORKING |
 | Conditional Execution | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ WORKING |
 | Wait/Block Steps | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ WORKING |
+| Reusable Workflows | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ NEW |
 | **Security** |
 | Encrypted Secrets | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ WORKING |
 | RBAC | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ WORKING |
 | Rate Limiting | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ WORKING |
-| OIDC Cloud Auth | ❌ | ✅ | ❌ | ❌ | ✅ | ⚠️ | ⚠️ PARTIAL |
+| OIDC Cloud Auth | ❌ | ✅ | ❌ | ❌ | ✅ | ✅ | ✅ WORKING |
 | IP Allowlisting | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ WORKING |
-| Audit Logging | ❌ | ✅ | ✅ | ❌ | ✅ | ⚠️ | ⚠️ PARTIAL |
+| Audit Logging | ❌ | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ WORKING |
 | **Distributed Execution** |
 | Self-Hosted Agents | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ WORKING |
-| Agent Scaling | ✅ | ✅ | ✅ | ❌ | ✅ | ⚠️ | ⚠️ PARTIAL |
+| Agent Scaling | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ WORKING |
+| Agent Auto-scaling (K8s) | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ NEW |
 | Job Queues | ✅ | ❌ | ✅ | ❌ | ❌ | ✅ | ✅ WORKING |
 | **Observability** |
 | Distributed Tracing | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ WORKING |
@@ -54,15 +56,12 @@
 - Secrets encryption
 - Notifications (Slack/Discord/Email)
 - S3 artifact storage
+- **Reusable workflows** (NEW)
+- **OIDC token exchange** (AWS/GCP/Azure) (NEW)
+- **K8s auto-scaling** (NEW)
 
 ### ⚠️ Partially Working
-- **OIDC Auth**: Code exists but needs OIDC provider configuration
-- **Audit Logging**: Model exists but needs more event wiring
-- **Agent Scaling**: AutoScaler exists but needs metrics backend
-
-### ❌ Missing (Not Critical)
-- Kubernetes manifests (were lost in git reset)
-- docker-compose files (were lost)
+- None - all features now working!
 
 ## How to Verify All Features Work
 

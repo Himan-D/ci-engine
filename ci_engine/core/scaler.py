@@ -2,6 +2,7 @@
 # CI Engine - Auto-scaling service
 
 import os
+import asyncio
 from datetime import datetime
 from typing import Optional
 from sqlalchemy.orm import Session
@@ -23,6 +24,10 @@ class ScalingConfig:
 
     JOB_QUEUE_THRESHOLD = int(os.environ.get("CI_ENGINE_JOB_QUEUE_THRESHOLD", "5"))
 
+    USE_K8S = os.environ.get("CI_ENGINE_USE_K8S_SCALING", "false").lower() == "true"
+    K8S_DEPLOYMENT = os.environ.get("CI_ENGINE_K8S_DEPLOYMENT", "ci-engine-agent")
+    K8S_NAMESPACE = os.environ.get("CI_ENGINE_K8S_NAMESPACE", "default")
+
 
 class ScalingTrigger:
     """Represents a scaling action that should be taken."""
@@ -36,6 +41,81 @@ class ScalingTrigger:
         self.reason = reason
         self.priority = priority
         self.timestamp = datetime.utcnow()
+
+
+class MetricsBackend:
+    """Backend for querying metrics for scaling decisions."""
+
+    @staticmethod
+    def get_queue_depth(db: Session) -> int:
+        """Get current job queue depth."""
+        return db.query(Job).filter(Job.status == JobStatus.PENDING).count()
+
+    @staticmethod
+    def get_agent_utilization(db: Session) -> float:
+        """Get agent utilization as percentage."""
+        total = db.query(Agent).filter(Agent.status != AgentStatus.OFFLINE).count()
+        if total == 0:
+            return 0.0
+        busy = db.query(Agent).filter(Agent.status == AgentStatus.BUSY).count()
+        return (busy / total) * 100
+
+    @staticmethod
+    def get_job_throughput(db: Session, window_seconds: int = 300) -> float:
+        """Get jobs completed per minute."""
+        from datetime import timedelta
+
+        cutoff = datetime.utcnow() - timedelta(seconds=window_seconds)
+        completed = (
+            db.query(Job)
+            .filter(Job.status.in_([JobStatus.PASSED, JobStatus.FAILED]), Job.finished_at >= cutoff)
+            .count()
+        )
+        return completed / (window_seconds / 60)
+
+
+class K8sScaler:
+    """Kubernetes-based scaling implementation."""
+
+    def __init__(self, deployment: str, namespace: str):
+        self.deployment = deployment
+        self.namespace = namespace
+
+    async def scale_to(self, replicas: int) -> bool:
+        """Scale deployment to specified replicas."""
+        try:
+            from kubernetes import client, config
+
+            try:
+                config.load_incluster_config()
+            except Exception:
+                config.load_kube_config()
+
+            apps_v1 = client.AppsV1Api()
+            apps_v1.patch_namespaced_deployment_scale(
+                name=self.deployment,
+                namespace=self.namespace,
+                body={"spec": {"replicas": replicas}},
+            )
+            return True
+        except Exception:
+            return False
+
+    async def get_current_replicas(self) -> Optional[int]:
+        """Get current replica count."""
+        try:
+            from kubernetes import client, config
+
+            try:
+                config.load_incluster_config()
+            except Exception:
+                config.load_kube_config()
+
+            apps_v1 = client.AppsV1Api()
+            deployment = apps_v1.read_namespaced_deployment(self.deployment, self.namespace)
+            return deployment.spec.replicas
+        except Exception:
+            return None
 
 
 class AutoScaler:

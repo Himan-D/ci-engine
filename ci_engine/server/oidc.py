@@ -2,8 +2,10 @@
 # CI Engine - OIDC Provider Configuration
 
 import os
+import httpx
 from typing import Optional
 from enum import Enum
+from pydantic import BaseModel
 
 
 class OIDCProvider(str, Enum):
@@ -13,6 +15,21 @@ class OIDCProvider(str, Enum):
     GCP = "gcp"
     AZURE = "azure"
     GITHUB = "github"
+
+
+class OIDCTokenRequest(BaseModel):
+    """OIDC token request."""
+
+    provider: str
+    token: str
+
+
+class OIDCTokenResponse(BaseModel):
+    """OIDC token response."""
+
+    access_token: str
+    expires_in: int
+    token_type: str = "Bearer"
 
 
 class OIDCConfig:
@@ -26,6 +43,7 @@ class OIDCConfig:
         issuer_url: str,
         audience: Optional[str] = None,
         scopes: list[str] | None = None,
+        jwks_url: Optional[str] = None,
     ):
         self.provider = provider
         self.client_id = client_id
@@ -33,6 +51,7 @@ class OIDCConfig:
         self.issuer_url = issuer_url
         self.audience = audience or client_id
         self.scopes = scopes or ["openid", "email", "profile"]
+        self.jwks_url = jwks_url
 
     def to_dict(self) -> dict:
         """Convert to dictionary."""
@@ -185,3 +204,122 @@ class OIDCTokenVerifier:
             return True
         except Exception:
             return False
+
+    @staticmethod
+    def verify_gcp_token(token: str, audience: str) -> bool:
+        """Verify GCP OIDC token."""
+        try:
+            import jwt
+
+            unverified = jwt.decode(token, options={"verify_signature": False})
+            iss = unverified.get("iss")
+            aud = unverified.get("aud")
+            if iss != OIDCProviderManager.GCP_ISSUER:
+                return False
+            if aud != audience:
+                return False
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def verify_azure_token(token: str, audience: str) -> bool:
+        """Verify Azure AD OIDC token."""
+        try:
+            import jwt
+
+            unverified = jwt.decode(token, options={"verify_signature": False})
+            iss = unverified.get("iss")
+            aud = unverified.get("aud")
+            if not iss or "login.microsoftonline.com" not in iss:
+                return False
+            if audience not in aud:
+                return False
+            return True
+        except Exception:
+            return False
+
+    @classmethod
+    def verify_token(cls, token: str, provider: str, audience: str) -> bool:
+        """Verify OIDC token based on provider."""
+        provider_lower = provider.lower()
+        if provider_lower == "github":
+            return cls.verify_github_token(token, audience)
+        elif provider_lower == "aws":
+            return cls.verify_aws_token(token, audience)
+        elif provider_lower == "gcp":
+            return cls.verify_gcp_token(token, audience)
+        elif provider_lower == "azure":
+            return cls.verify_azure_token(token, audience)
+        return False
+
+
+class OIDCTokenExchange:
+    """Exchange OIDC tokens for service-specific credentials."""
+
+    @staticmethod
+    async def exchange_aws(token: str, role_arn: str, region: str = "us-east-1") -> Optional[dict]:
+        """Exchange OIDC token for AWS credentials."""
+        try:
+            import boto3
+
+            sts = boto3.client("sts", region_name=region)
+            response = sts.assume_role_with_web_identity(
+                RoleArn=role_arn,
+                RoleSessionName="ci-engine-session",
+                WebIdentityToken=token,
+                DurationSeconds=3600,
+            )
+            return {
+                "access_key": response["Credentials"]["AccessKeyId"],
+                "secret_key": response["Credentials"]["SecretAccessKey"],
+                "session_token": response["Credentials"]["SessionToken"],
+                "expiration": response["Credentials"]["Expiration"].isoformat(),
+            }
+        except Exception:
+            return None
+
+    @staticmethod
+    async def exchange_gcp(token: str, service_account: str, audience: str) -> Optional[dict]:
+        """Exchange OIDC token for GCP credentials."""
+        try:
+            import google.auth
+            import google.auth.transport.requests
+
+            credentials = google.oauth2.credentials.Credentials(
+                token=token,
+                audience=audience,
+            )
+            credentials.refresh(google.auth.transport.requests.Request())
+            return {
+                "token": credentials.token,
+                "expiry": credentials.expiry.isoformat() if credentials.expiry else None,
+            }
+        except Exception:
+            return None
+
+    @staticmethod
+    async def exchange_azure(
+        token: str, client_id: str, client_secret: str, tenant_id: str
+    ) -> Optional[dict]:
+        """Exchange OIDC token for Azure credentials."""
+        try:
+            async with httpx.AsyncClient() as client:
+                token_url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
+                data = {
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                    "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                    "assertion": token,
+                    "scope": f"api://{client_id}/.default",
+                }
+                response = await client.post(token_url, data=data)
+                if response.status_code == 200:
+                    result = response.json()
+                    return {
+                        "access_token": result.get("access_token"),
+                        "expires_in": result.get("expires_in"),
+                        "token_type": result.get("token_type", "Bearer"),
+                    }
+        except Exception:
+            return None
