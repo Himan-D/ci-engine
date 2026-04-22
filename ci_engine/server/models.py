@@ -109,9 +109,28 @@ class AgentSkill(Base):
     name = Column(String(100), nullable=False)
     level = Column(Integer, default=1)
     enabled = Column(Boolean, default=True)
+    category = Column(String(50), nullable=True)
+    version = Column(String(50), nullable=True)
+    description = Column(Text, nullable=True)
+    extra_data = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     agent = relationship("Agent", back_populates="agent_skills")
+
+
+class SkillDefinition(Base):
+    __tablename__ = "skill_definitions"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(100), unique=True, nullable=False)
+    display_name = Column(String(200), nullable=False)
+    category = Column(String(50), nullable=False)
+    description = Column(Text, nullable=True)
+    detect_command = Column(String(500), nullable=True)
+    min_version = Column(String(50), nullable=True)
+    required_tools = Column(Text, nullable=True)
+    tags = Column(Text, nullable=True)
+    is_active = Column(Boolean, default=True)
 
 
 class JobLog(Base):
@@ -252,6 +271,14 @@ class WebhookResponse(BaseModel):
 class AgentSkillCreate(BaseModel):
     name: str
     level: int = 1
+    category: Optional[str] = None
+    version: Optional[str] = None
+
+
+class AgentSkillUpdate(BaseModel):
+    level: Optional[int] = None
+    enabled: Optional[bool] = None
+    version: Optional[str] = None
 
 
 class AgentSkillResponse(BaseModel):
@@ -259,12 +286,33 @@ class AgentSkillResponse(BaseModel):
     name: str
     level: int
     enabled: bool
+    category: Optional[str] = None
+    version: Optional[str] = None
+    description: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
 
 
 class AgentSkillsUpdate(BaseModel):
     skills: list[AgentSkillCreate]
+
+
+class SkillDefinitionResponse(BaseModel):
+    id: int
+    name: str
+    display_name: str
+    category: str
+    description: Optional[str]
+    min_version: Optional[str]
+    tags: Optional[str]
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class SkillCategoryResponse(BaseModel):
+    category: str
+    display_name: str
+    skill_count: int
 
 
 # Pydantic models for artifacts

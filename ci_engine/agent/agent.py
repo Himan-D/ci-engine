@@ -591,8 +591,41 @@ def main():
         default=[],
         help="Agent skills (e.g., docker kubernetes python)",
     )
+    parser.add_argument(
+        "--auto-detect-skills",
+        action="store_true",
+        help="Auto-detect installed skills on this machine",
+    )
+    parser.add_argument(
+        "--list-skills",
+        action="store_true",
+        help="List all available skills and exit",
+    )
 
     args = parser.parse_args()
+
+    if args.list_skills:
+        from ci_engine.agent.skills import list_all_skills
+
+        skills = list_all_skills()
+        print(f"\n=== Available Skills ({skills['total']}) ===\n")
+        for category, info in skills["categories"].items():
+            cat_skills = [s for s in skills["skills"] if s["category"] == category]
+            print(f"\n## {info['display_name']} ({len(cat_skills)} skills)")
+            for s in cat_skills:
+                print(f"  - {s['name']}: {s['description']}")
+        return
+
+    if args.auto_detect_skills:
+        from ci_engine.agent.skills import auto_detect_skills
+
+        print("Detecting installed skills...")
+        detected = auto_detect_skills()
+        print(f"\nDetected {detected['summary']['total_installed']} skills:\n")
+        for cat, info in detected["summary"]["by_category"].items():
+            if info["installed"] > 0:
+                print(f"  {cat}: {', '.join(info['skills'])}")
+        args.skills = [s["name"] for s in detected["skills"]]
 
     agent = Agent(
         args.server,

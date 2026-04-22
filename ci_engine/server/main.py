@@ -469,6 +469,170 @@ def get_scaling_recommendations(db: Session = Depends(get_db)):
     return check_and_trigger_scaling(db)
 
 
+@app.get("/api/skills")
+def get_all_skills():
+    """Get all available skill definitions."""
+    from ci_engine.core.skills import list_all_skills
+
+    return list_all_skills()
+
+
+@app.get("/api/skills/categories")
+def get_skill_categories():
+    """Get all skill categories."""
+    from ci_engine.core.skills import SKILL_CATEGORIES
+
+    return [
+        {"key": key, "display_name": value["display_name"], "description": value["description"]}
+        for key, value in SKILL_CATEGORIES.items()
+    ]
+
+
+@app.get("/api/agents/{agent_id}/skills")
+def get_agent_skills(agent_id: int, db: Session = Depends(get_db)):
+    """Get all skills for an agent."""
+    agent = db.query(Agent).filter(Agent.id == agent_id).first()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    return [
+        {
+            "id": skill.id,
+            "name": skill.name,
+            "level": skill.level,
+            "category": skill.category,
+            "version": skill.version,
+            "enabled": skill.enabled,
+            "description": skill.description,
+        }
+        for skill in agent.agent_skills
+    ]
+
+
+@app.post("/api/agents/{agent_id}/skills")
+def add_agent_skill(agent_id: int, skill_data: AgentSkillCreate, db: Session = Depends(get_db)):
+    """Add a skill to an agent."""
+    agent = db.query(Agent).filter(Agent.id == agent_id).first()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    existing = (
+        db.query(AgentSkill)
+        .filter(AgentSkill.agent_id == agent_id, AgentSkill.name == skill_data.name)
+        .first()
+    )
+
+    if existing:
+        existing.level = skill_data.level
+        existing.category = skill_data.category or existing.category
+        existing.version = skill_data.version or existing.version
+        db.commit()
+        db.refresh(existing)
+        return existing
+
+    skill = AgentSkill(
+        agent_id=agent_id,
+        name=skill_data.name,
+        level=skill_data.level,
+        category=skill_data.category,
+        version=skill_data.version,
+    )
+    db.add(skill)
+    db.commit()
+    db.refresh(skill)
+    return skill
+
+
+@app.put("/api/agents/{agent_id}/skills/{skill_name}")
+def update_agent_skill(
+    agent_id: int, skill_name: str, skill_update: AgentSkillUpdate, db: Session = Depends(get_db)
+):
+    """Update a skill for an agent."""
+    agent = db.query(Agent).filter(Agent.id == agent_id).first()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    skill = (
+        db.query(AgentSkill)
+        .filter(AgentSkill.agent_id == agent_id, AgentSkill.name == skill_name)
+        .first()
+    )
+
+    if not skill:
+        raise HTTPException(status_code=404, detail="Skill not found")
+
+    if skill_update.level is not None:
+        skill.level = skill_update.level
+    if skill_update.enabled is not None:
+        skill.enabled = skill_update.enabled
+    if skill_update.version is not None:
+        skill.version = skill_update.version
+
+    db.commit()
+    db.refresh(skill)
+    return skill
+
+
+@app.delete("/api/agents/{agent_id}/skills/{skill_name}")
+def delete_agent_skill(agent_id: int, skill_name: str, db: Session = Depends(get_db)):
+    """Delete a skill from an agent."""
+    agent = db.query(Agent).filter(Agent.id == agent_id).first()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    skill = (
+        db.query(AgentSkill)
+        .filter(AgentSkill.agent_id == agent_id, AgentSkill.name == skill_name)
+        .first()
+    )
+
+    if not skill:
+        raise HTTPException(status_code=404, detail="Skill not found")
+
+    db.delete(skill)
+    db.commit()
+    return {"message": "Skill deleted successfully"}
+
+
+@app.post("/api/agents/{agent_id}/skills/auto-detect")
+def auto_detect_agent_skills(agent_id: int, db: Session = Depends(get_db)):
+    """Auto-detect and update agent skills."""
+    from ci_engine.agent.skills import auto_detect_skills
+
+    agent = db.query(Agent).filter(Agent.id == agent_id).first()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    detected = auto_detect_skills()
+
+    for skill_info in detected["skills"]:
+        existing = (
+            db.query(AgentSkill)
+            .filter(AgentSkill.agent_id == agent_id, AgentSkill.name == skill_info["name"])
+            .first()
+        )
+
+        if existing:
+            existing.version = skill_info.get("version")
+            existing.category = skill_info.get("category")
+        else:
+            skill = AgentSkill(
+                agent_id=agent_id,
+                name=skill_info["name"],
+                level=skill_info.get("level", 1),
+                category=skill_info.get("category"),
+                version=skill_info.get("version"),
+                enabled=True,
+            )
+            db.add(skill)
+
+    db.commit()
+    return {
+        "message": f"Auto-detected {len(detected['skills'])} skills",
+        "detected": detected["summary"],
+    }
+
+
 # Job endpoints
 @app.post("/api/jobs/{job_id}/claim")
 def claim_job(job_id: int, agent_id: int, db: Session = Depends(get_db)):

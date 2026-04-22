@@ -45,13 +45,29 @@ class Scheduler:
         if not required_skills:
             return Scheduler.find_available_agent(db, None)
 
-        skill_names = [s.strip() for s in required_skills]
+        skill_requirements = []
+        for s in required_skills:
+            if ":" in s:
+                name, level = s.split(":")
+                skill_requirements.append((name.strip(), int(level.strip())))
+            else:
+                skill_requirements.append((s.strip(), 1))
 
         idle_agents = db.query(Agent).filter(Agent.status == AgentStatus.IDLE).all()
 
         for agent in idle_agents:
-            agent_skill_names = [s.name for s in agent.agent_skills if s.enabled]
-            if all(skill in agent_skill_names for skill in skill_names):
+            agent_skills = {s.name: s.level for s in agent.agent_skills if s.enabled}
+
+            matches = True
+            for skill_name, min_level in skill_requirements:
+                if skill_name not in agent_skills:
+                    matches = False
+                    break
+                if agent_skills[skill_name] < min_level:
+                    matches = False
+                    break
+
+            if matches:
                 return agent
 
         return None
