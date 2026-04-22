@@ -597,34 +597,82 @@ def main():
         help="Auto-detect installed skills on this machine",
     )
     parser.add_argument(
+        "--force-detect",
+        action="store_true",
+        help="Force re-detection even if cached",
+    )
+    parser.add_argument(
+        "--category",
+        type=str,
+        default=None,
+        help="Filter skills by category (e.g., build, test, deploy)",
+    )
+    parser.add_argument(
         "--list-skills",
         action="store_true",
         help="List all available skills and exit",
     )
+    parser.add_argument(
+        "--clear-cache",
+        action="store_true",
+        help="Clear skill cache before detection",
+    )
 
     args = parser.parse_args()
+
+    if args.clear_cache:
+        from ci_engine.agent.skills import SkillCache
+
+        SkillCache.clear()
+        print("Skill cache cleared.")
 
     if args.list_skills:
         from ci_engine.agent.skills import list_all_skills
 
         skills = list_all_skills()
+        category_filter = args.category
+
         print(f"\n=== Available Skills ({skills['total']}) ===\n")
-        for category, info in skills["categories"].items():
-            cat_skills = [s for s in skills["skills"] if s["category"] == category]
+
+        if category_filter:
+            cat_skills = [s for s in skills["skills"] if s["category"] == category_filter]
+            info = skills["categories"].get(
+                category_filter, {"display_name": category_filter.title()}
+            )
             print(f"\n## {info['display_name']} ({len(cat_skills)} skills)")
             for s in cat_skills:
-                print(f"  - {s['name']}: {s['description']}")
+                custom_tag = " [CUSTOM]" if s.get("custom") else ""
+                print(f"  - {s['name']}: {s['description']}{custom_tag}")
+        else:
+            for category, info in skills["categories"].items():
+                cat_skills = [s for s in skills["skills"] if s["category"] == category]
+                print(f"\n## {info['display_name']} ({len(cat_skills)} skills)")
+                for s in cat_skills:
+                    custom_tag = " [CUSTOM]" if s.get("custom") else ""
+                    print(f"  - {s['name']}: {s['description']}{custom_tag}")
         return
 
     if args.auto_detect_skills:
         from ci_engine.agent.skills import auto_detect_skills
 
         print("Detecting installed skills...")
-        detected = auto_detect_skills()
+        detected = auto_detect_skills(force=args.force_detect or args.clear_cache)
         print(f"\nDetected {detected['summary']['total_installed']} skills:\n")
-        for cat, info in detected["summary"]["by_category"].items():
-            if info["installed"] > 0:
-                print(f"  {cat}: {', '.join(info['skills'])}")
+
+        category_filter = args.category
+        if category_filter:
+            if category_filter in detected["summary"]["by_category"]:
+                info = detected["summary"]["by_category"][category_filter]
+                print(f"  {category_filter}: {', '.join(info['skills'])}")
+        else:
+            for cat, info in detected["summary"]["by_category"].items():
+                if info["installed"] > 0:
+                    print(f"  {cat}: {', '.join(info['skills'])}")
+
+        health = detected["summary"].get("health", {})
+        if health.get("unhealthy", 0) > 0:
+            print(f"\n⚠️  {health['unhealthy']} skills marked as unhealthy")
+
         args.skills = [s["name"] for s in detected["skills"]]
 
     agent = Agent(
