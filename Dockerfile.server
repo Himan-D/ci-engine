@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: MIT
+# CI Engine - Multi-stage Dockerfile
+
+FROM python:3.12-slim AS builder
+
+WORKDIR /build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY pyproject.toml ./
+RUN pip install --no-cache-dir --prefix=/install -e .
+
+FROM python:3.12-slim
+
+WORKDIR /app
+
+RUN useradd -m -u 1000 ci-engine && \
+    apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /install /usr/local
+COPY --from=builder /home/ci-engine/.venv/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
+
+RUN mkdir -p /workspace /tmp/ci-engine-workspace && chown ci-engine:ci-engine /workspace /tmp/ci-engine-workspace
+
+USER ci-engine
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    DATABASE_URL=postgresql://ci_engine:ci_engine@postgres/ci_engine
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+CMD ["uvicorn", "ci_engine.server.main:app", "--host", "0.0.0.0", "--port", "8000"]
