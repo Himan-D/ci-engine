@@ -26,6 +26,8 @@ from ci_engine.server.models import (
     AgentCreate,
     AgentResponse,
     AgentSkill,
+    AgentSkillCreate,
+    AgentSkillUpdate,
     AgentPool,
     AgentPoolCreate,
     AgentPoolResponse,

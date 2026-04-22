@@ -5,6 +5,7 @@ import os
 import json
 import hashlib
 import shutil
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Optional
 from pathlib import Path
@@ -245,6 +246,3 @@ def get_cache() -> LocalCache:
     if _cache is None:
         _cache = LocalCache()
     return _cache
-
-
-from dataclasses import dataclass
