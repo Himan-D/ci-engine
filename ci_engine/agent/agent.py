@@ -101,7 +101,7 @@ class Agent:
             return response.status_code == 200
         except requests.RequestException as e:
             print(f"Failed to claim job: {e}")
-            return False
+        return False
 
     def connect_websocket(self, job_id: int) -> bool:
         """Connect to WebSocket for real-time log streaming."""
@@ -139,39 +139,89 @@ class Agent:
         return False
 
     def execute_job(self, job: dict) -> int:
-        """Execute a job and return exit code."""
+        """Execute a job and return exit code.
+
+        Uses Executor class for proper isolation, timeout handling, and container support.
+        """
+        import os as os_module
         import subprocess
 
         print(f"Executing job #{job['id']}: {job['label']}")
         print(f"Command: {job['command']}")
 
         job_id = job["id"]
+        command = job.get("command", "")
+        container_image = job.get("container_image")
+        timeout_seconds = job.get("timeout_seconds", 3600)
 
         if self.use_websocket:
             self.connect_websocket(job_id)
 
         try:
-            result = subprocess.run(
-                job["command"],
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=3600,
-            )
-            exit_code = result.returncode
+            if container_image:
+                print(f"Running in container: {container_image}")
+                from ci_engine.core.container import execute_in_container
 
-            if result.stdout:
-                if not self.send_log_ws(job_id, "stdout", result.stdout):
-                    self._send_log(job_id, "stdout", result.stdout)
-            if result.stderr:
-                if not self.send_log_ws(job_id, "stderr", result.stderr):
-                    self._send_log(job_id, "stderr", result.stderr)
+                workspace_dir = os_module.environ.get("CI_WORKSPACE", "/tmp/ci-engine-workspace")
+                os_module.makedirs(workspace_dir, exist_ok=True)
+
+                env_vars = {}
+                env_var_str = job.get("env_vars", "")
+                if env_var_str:
+                    try:
+                        env_vars = json.loads(env_var_str)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+
+                result = execute_in_container(
+                    image=container_image,
+                    command=command,
+                    env_vars=env_vars,
+                    timeout=timeout_seconds,
+                    workspace=workspace_dir,
+                    build_id=job.get("build_id", 0),
+                )
+                exit_code = result.exit_code
+                stdout = result.stdout
+                stderr = result.stderr
+            else:
+                from ci_engine.core.executor import Executor
+
+                executor = Executor(
+                    workspace=os_module.environ.get("CI_WORKSPACE", "/tmp/ci-engine-workspace")
+                )
+
+                env_vars = {}
+                env_var_str = job.get("env_vars", "")
+                if env_var_str:
+                    try:
+                        env_vars = json.loads(env_var_str)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+
+                exit_code, stdout, stderr = executor.execute(
+                    command=command,
+                    env=env_vars if env_vars else None,
+                    timeout=timeout_seconds,
+                )
+
+            if stdout:
+                if not self.send_log_ws(job_id, "stdout", stdout):
+                    self._send_log(job_id, "stdout", stdout)
+            if stderr:
+                if not self.send_log_ws(job_id, "stderr", stderr):
+                    self._send_log(job_id, "stderr", stderr)
 
             return exit_code
 
         except subprocess.TimeoutExpired:
-            self.send_log_ws(job_id, "stderr", "Job timed out after 1 hour")
-            self._send_log(job_id, "stderr", "Job timed out after 1 hour")
+            self.send_log_ws(job_id, "stderr", f"Job timed out after {timeout_seconds}s")
+            self._send_log(job_id, "stderr", f"Job timed out after {timeout_seconds}s")
+            return -1
+        except ValueError as e:
+            error_msg = f"Invalid command syntax: {e}"
+            self.send_log_ws(job_id, "stderr", error_msg)
+            self._send_log(job_id, "stderr", error_msg)
             return -1
         except Exception as e:
             error_msg = str(e)
