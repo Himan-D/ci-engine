@@ -21,13 +21,13 @@ class TestExecutor:
 
     def test_execute_command_with_error(self, executor):
         """Test executing a command that fails."""
-        exit_code, stdout, stderr = executor.execute("exit 1")
+        exit_code, stdout, stderr = executor.execute("false")
         assert exit_code == 1
 
     def test_execute_command_with_env(self, executor):
         """Test executing command with environment variables."""
         exit_code, stdout, stderr = executor.execute(
-            "echo $TEST_VAR", env={"TEST_VAR": "test_value"}
+            "sh -c 'echo $TEST_VAR'", env={"TEST_VAR": "test_value"}
         )
         assert exit_code == 0
         assert "test_value" in stdout

@@ -1,0 +1,83 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ci-engine-agent
+  labels:
+    app: ci-engine
+    component: agent
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: ci-engine
+      component: agent
+  template:
+    metadata:
+      labels:
+        app: ci-engine
+        component: agent
+    spec:
+      serviceAccountName: ci-engine-agent
+      containers:
+      - name: agent
+        image: ci-engine/agent:latest
+        env:
+        - name: CI_SERVER_URL
+          value: "http://ci-engine-server:8000"
+        - name: CI_AGENT_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: CI_WORKSPACE
+          value: "/workspace"
+        - name: DOCKER_HOST
+          value: "unix:///var/run/docker.sock"
+        securityContext:
+          runAsUser: 1000
+          fsGroup: 1000
+        volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+        - name: docker-socket
+          mountPath: /var/run/docker.sock
+        resources:
+          requests:
+            cpu: 250m
+            memory: 256Mi
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+        livenessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - curl -f http://localhost:9300/health || exit 1
+          initialDelaySeconds: 30
+          periodSeconds: 30
+      volumes:
+      - name: workspace
+        emptyDir: {}
+      - name: docker-socket
+        hostPath:
+          path: /var/run/docker.sock
+          type: Socket
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: ci-engine-agent
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: ci-engine-agent
+  minReplicas: 1
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70

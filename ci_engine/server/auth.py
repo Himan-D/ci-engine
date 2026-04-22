@@ -3,6 +3,7 @@
 
 import hashlib
 import secrets
+import bcrypt
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -74,18 +75,16 @@ class TokenVerify(BaseModel):
 
 # Authentication functions
 def hash_password(password: str) -> str:
-    """Hash a password using SHA-256 with salt."""
-    salt = secrets.token_hex(16)
-    pwd_hash = hashlib.sha256((salt + password).encode()).hexdigest()
-    return f"{salt}${pwd_hash}"
+    """Hash a password using bcrypt."""
+    salt = bcrypt.gensalt(rounds=12)
+    return bcrypt.hashpw(password.encode(), salt).decode()
 
 
 def verify_password(password: str, password_hash: str) -> bool:
     """Verify a password against a hash."""
     try:
-        salt, pwd_hash = password_hash.split("$")
-        return pwd_hash == hashlib.sha256((salt + password).encode()).hexdigest()
-    except ValueError:
+        return bcrypt.checkpw(password.encode(), password_hash.encode())
+    except (ValueError, TypeError):
         return False
 
 

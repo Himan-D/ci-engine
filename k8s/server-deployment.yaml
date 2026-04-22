@@ -1,0 +1,123 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ci-engine-server
+  labels:
+    app: ci-engine
+    component: server
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ci-engine
+      component: server
+  template:
+    metadata:
+      labels:
+        app: ci-engine
+        component: server
+    spec:
+      containers:
+      - name: server
+        image: ci-engine/server:latest
+        ports:
+        - containerPort: 8000
+          name: http
+        - containerPort: 9090
+          name: metrics
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: ci-engine-secrets
+              key: database-url
+        - name: SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: ci-engine-secrets
+              key: secret-key
+        - name: ENCRYPTION_KEY
+          valueFrom:
+            secretKeyRef:
+              name: ci-engine-secrets
+              key: encryption-key
+        - name: S3_BUCKET
+          valueFrom:
+            configMapKeyRef:
+              name: ci-engine-config
+              key: s3-bucket
+        - name: REDIS_URL
+          value: "redis://ci-engine-redis:6379"
+        - name: OTEL_EXPORTER_OTLP_ENDPOINT
+          value: "http://ci-engine-otel-collector:4317"
+        - name: OTEL_SERVICE_NAME
+          value: "ci-engine-server"
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 1Gi
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 10
+      - name: otel-sidecar
+        image: otel/opentelemetry-collector:0.98.0
+        args:
+        - --config=/etc/otel/config.yaml
+        volumeMounts:
+        - name: otel-config
+          mountPath: /etc/otel
+        resources:
+          limits:
+            cpu: 100m
+            memory: 128Mi
+      volumes:
+      - name: otel-config
+        configMap:
+          name: ci-engine-otel-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ci-engine-server
+  labels:
+    app: ci-engine
+spec:
+  type: ClusterIP
+  ports:
+  - port: 8000
+    targetPort: 8000
+    name: http
+  - port: 9090
+    targetPort: 9090
+    name: metrics
+  selector:
+    app: ci-engine
+    component: server
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ci-engine-server-lb
+  labels:
+    app: ci-engine
+spec:
+  type: LoadBalancer
+  ports:
+  - port: 80
+    targetPort: 8000
+    name: http
+  selector:
+    app: ci-engine
+    component: server

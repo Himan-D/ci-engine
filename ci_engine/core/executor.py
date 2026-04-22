@@ -3,6 +3,7 @@
 
 import subprocess
 import os
+import shlex
 from typing import Optional
 from pathlib import Path
 from dataclasses import dataclass
@@ -51,9 +52,13 @@ class Executor:
         work_dir = cwd or str(self.workspace)
 
         try:
+            cmd_args = shlex.split(command)
+        except ValueError as e:
+            return -1, "", f"Invalid command syntax: {e}"
+
+        try:
             result = subprocess.run(
-                command,
-                shell=True,
+                cmd_args,
                 cwd=work_dir,
                 env=exec_env,
                 capture_output=True,
@@ -83,9 +88,19 @@ class Executor:
         work_dir = cwd or str(self.workspace)
 
         try:
+            cmd_args = shlex.split(command)
+        except ValueError as e:
+            return ExecutionResult(
+                status=ExecutionStatus.ERROR,
+                exit_code=-1,
+                stdout="",
+                stderr=f"Invalid command syntax: {e}",
+                timed_out=False,
+            )
+
+        try:
             result = subprocess.run(
-                command,
-                shell=True,
+                cmd_args,
                 cwd=work_dir,
                 env=exec_env,
                 capture_output=True,

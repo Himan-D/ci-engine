@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: MIT
-# CI Engine - Build Notifications (Slack/Discord)
+# CI Engine - Build Notifications (Slack/Discord/Email)
 
 import os
+import smtplib
+import asyncio
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from typing import Optional
 from enum import Enum
 
@@ -41,11 +45,25 @@ class NotificationConfig(BaseModel):
     username: Optional[str] = None
 
 
+class EmailConfig(BaseModel):
+    """Email notification configuration."""
+
+    smtp_host: str
+    smtp_port: int = 587
+    smtp_user: str
+    smtp_password: str
+    email_from: str
+    email_to: str
+    events: list[NotificationEvent]
+    enabled: bool = True
+
+
 class NotificationService:
     """Service for sending build notifications."""
 
     def __init__(self):
         self._configs: list[NotificationConfig] = []
+        self._email_config: Optional[EmailConfig] = None
         self._load_configs()
 
     def _load_configs(self):
@@ -76,6 +94,20 @@ class NotificationService:
                 )
             )
 
+        smtp_host = os.environ.get("SMTP_HOST")
+        if smtp_host:
+            events_str = os.environ.get("EMAIL_NOTIFY_EVENTS", "build.completed,build.failed")
+            events = [NotificationEvent(e.strip()) for e in events_str.split(",")]
+            self._email_config = EmailConfig(
+                smtp_host=smtp_host,
+                smtp_port=int(os.environ.get("SMTP_PORT", "587")),
+                smtp_user=os.environ.get("SMTP_USER", ""),
+                smtp_password=os.environ.get("SMTP_PASSWORD", ""),
+                email_from=os.environ.get("EMAIL_FROM", os.environ.get("SMTP_USER", "")),
+                email_to=os.environ.get("EMAIL_TO", ""),
+                events=events,
+            )
+
     def notify(self, event: NotificationEvent, data: dict) -> int:
         """Send notification for an event."""
         sent = 0
@@ -89,6 +121,13 @@ class NotificationService:
                     self._send_slack(config, event, data)
                 elif config.type == NotificationType.DISCORD:
                     self._send_discord(config, event, data)
+                sent += 1
+            except Exception:
+                pass
+
+        if self._email_config and event in self._email_config.events:
+            try:
+                self._send_email(event, data)
                 sent += 1
             except Exception:
                 pass
@@ -165,6 +204,52 @@ class NotificationService:
         payload = {"embeds": [embed]}
 
         requests.post(config.webhook_url, json=payload, timeout=5)
+
+    def _send_email(self, event: NotificationEvent, data: dict):
+        """Send email notification."""
+        if not self._email_config:
+            return
+
+        title = self._get_notification_title(event, data)
+        body = self._format_email_body(event, data)
+
+        msg = MIMEMultipart()
+        msg["From"] = self._email_config.email_from
+        msg["To"] = self._email_config.email_to
+        msg["Subject"] = f"[CI Engine] {title}"
+
+        msg.attach(MIMEText(body, "html"))
+
+        with smtplib.SMTP(
+            self._email_config.smtp_host,
+            self._email_config.smtp_port,
+        ) as server:
+            server.starttls()
+            server.login(self._email_config.smtp_user, self._email_config.smtp_password)
+            server.send_message(msg)
+
+    def _format_email_body(self, event: NotificationEvent, data: dict) -> str:
+        """Format email body HTML."""
+        html = ["<html><body>"]
+
+        if "build" in data:
+            build = data["build"]
+            html.append(f"<h2>Build #{build.get('id')}</h2>")
+            html.append(f"<p><strong>Branch:</strong> {build.get('branch', 'N/A')}</p>")
+            html.append(f"<p><strong>Status:</strong> {build.get('status', 'N/A')}</p>")
+            html.append(
+                f"<p><strong>Commit:</strong> {build.get('commit', 'N/A')[:8] if build.get('commit') else 'N/A'}</p>"
+            )
+
+        if "job" in data:
+            job = data["job"]
+            html.append(f"<h3>Job: {job.get('label', 'N/A')}</h3>")
+            html.append(f"<p><strong>Exit Code:</strong> {job.get('exit_code', 'N/A')}</p>")
+
+        html.append(f"<p><em>Timestamp: {data.get('timestamp', 'N/A')}</em></p>")
+        html.append("</body></html>")
+
+        return "".join(html)
 
     def _get_notification_title(self, event: NotificationEvent, data: dict) -> str:
         """Get notification title based on event."""
