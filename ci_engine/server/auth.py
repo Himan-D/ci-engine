@@ -4,7 +4,7 @@
 import hashlib
 import secrets
 import bcrypt
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from sqlalchemy import Column, Integer, String, DateTime, Boolean
@@ -20,7 +20,7 @@ class User(Base):
     username = Column(String(100), unique=True, nullable=False)
     password_hash = Column(String(256), nullable=False)
     role = Column(String(20), default="developer")  # admin, developer, viewer
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     last_login = Column(DateTime, nullable=True)
     is_active = Column(Boolean, default=True)
 
@@ -32,7 +32,7 @@ class ApiToken(Base):
     token_hash = Column(String(256), unique=True, nullable=False)
     name = Column(String(100), nullable=False)
     user_id = Column(Integer, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     expires_at = Column(DateTime, nullable=True)
     last_used = Column(DateTime, nullable=True)
     is_active = Column(Boolean, default=True)
@@ -121,7 +121,7 @@ class AuthService:
         if not user or not user.is_active:
             return None
         if verify_password(password, user.password_hash):
-            user.last_login = datetime.utcnow()
+            user.last_login = datetime.now(timezone.utc)
             db.commit()
             return user
         return None
@@ -136,7 +136,7 @@ class AuthService:
 
         expires_at = None
         if expires_in_days:
-            expires_at = datetime.utcnow() + timedelta(days=expires_in_days)
+            expires_at = datetime.now(timezone.utc) + timedelta(days=expires_in_days)
 
         api_token = ApiToken(
             token_hash=token_hash,
@@ -166,11 +166,11 @@ class AuthService:
             return None
 
         # Check expiration
-        if api_token.expires_at and api_token.expires_at < datetime.utcnow():
+        if api_token.expires_at and api_token.expires_at < datetime.now(timezone.utc):
             return None
 
         # Update last used
-        api_token.last_used = datetime.utcnow()
+        api_token.last_used = datetime.now(timezone.utc)
         db.commit()
 
         return db.query(User).filter(User.id == api_token.user_id).first()

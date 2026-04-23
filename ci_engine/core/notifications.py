@@ -313,22 +313,18 @@ notification_service = NotificationService()
 
 def send_build_notification(event: NotificationEvent, build_data: dict):
     """Send build notification."""
-    from datetime import datetime
-
     data = {
         "build": build_data,
-        "timestamp": int(datetime.utcnow().timestamp()),
+        "timestamp": int(datetime.now(timezone.utc).timestamp()),
     }
     notification_service.notify(event, data)
 
 
 def send_job_notification(event: NotificationEvent, job_data: dict, build_data: dict):
     """Send job notification."""
-    from datetime import datetime
-
     data = {
         "build": build_data,
         "job": job_data,
-        "timestamp": int(datetime.utcnow().timestamp()),
+        "timestamp": int(datetime.now(timezone.utc).timestamp()),
     }
     notification_service.notify(event, data)

@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Optional
 from dataclasses import dataclass, field, asdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from ci_engine.core.skills import SKILL_DEFINITIONS, get_skill_by_name, SKILL_CATEGORIES
 
@@ -34,7 +34,7 @@ class DetectedSkill:
     installed: bool
     path: Optional[str]
     level: int = 1
-    detected_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    detected_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     health_status: str = "unknown"
 
 
@@ -69,7 +69,7 @@ class SkillCache:
                 cache = json.load(f)
 
             cached_at = datetime.fromisoformat(cache.get("cached_at", "2000-01-01"))
-            if datetime.utcnow() - cached_at > timedelta(hours=SKILL_CACHE_TTL_HOURS):
+            if datetime.now(timezone.utc) - cached_at > timedelta(hours=SKILL_CACHE_TTL_HOURS):
                 return None
 
             return cache.get("skills", {})
@@ -82,7 +82,7 @@ class SkillCache:
         cache_path = cls.get_cache_path()
         try:
             cache = {
-                "cached_at": datetime.utcnow().isoformat(),
+                "cached_at": datetime.now(timezone.utc).isoformat(),
                 "skills": skills,
             }
             with open(cache_path, "w") as f:

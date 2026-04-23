@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # CI Engine - Core models and database
 
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional, Any
 from pydantic import BaseModel, ConfigDict
@@ -47,7 +47,7 @@ class Build(Base):
     git_ref = Column(String(100), nullable=True)
     clone_depth = Column(Integer, nullable=True)
     status = Column(SQLEnum(BuildStatus), default=BuildStatus.PENDING)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)
 
@@ -76,7 +76,7 @@ class Job(Base):
     skip_condition = Column(String(500), nullable=True)
     required_skills = Column(String(500), nullable=True)
     depends_on = Column(String(500), nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)
 
@@ -98,7 +98,7 @@ class Agent(Base):
     pool_id = Column(Integer, ForeignKey("agent_pools.id"), nullable=True)
     version = Column(String(50), nullable=True)
     drain_mode = Column(Boolean, default=False)
-    registered_at = Column(DateTime, default=datetime.utcnow)
+    registered_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     last_seen = Column(DateTime, nullable=True)
 
     jobs = relationship("Job", back_populates="agent")
@@ -115,7 +115,7 @@ class AgentPool(Base):
     max_agents = Column(Integer, default=0)
     min_agents = Column(Integer, default=0)
     scaling_enabled = Column(Boolean, default=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     agents = relationship("Agent", back_populates="pool")
 
@@ -127,7 +127,7 @@ class AgentLabel(Base):
     agent_id = Column(Integer, ForeignKey("agents.id"), nullable=False)
     key = Column(String(100), nullable=False)
     value = Column(String(200), nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
 class AgentSkill(Base):
@@ -142,7 +142,7 @@ class AgentSkill(Base):
     version = Column(String(50), nullable=True)
     description = Column(Text, nullable=True)
     extra_data = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     agent = relationship("Agent", back_populates="agent_skills")
 
@@ -167,7 +167,7 @@ class JobLog(Base):
 
     id = Column(Integer, primary_key=True)
     job_id = Column(Integer, ForeignKey("jobs.id"))
-    timestamp = Column(DateTime, default=datetime.utcnow)
+    timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     stream = Column(String(10), default="stdout")
     line = Column(Text, nullable=False)
 
@@ -298,7 +298,7 @@ class WebhookConfig(Base):
     events = Column(String(200), nullable=False)
     secret = Column(String(200), nullable=True)
     is_active = Column(Boolean, default=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
 class Artifact(Base):
@@ -313,7 +313,7 @@ class Artifact(Base):
     storage_key = Column(String(500), nullable=False)
     checksum = Column(String(64), nullable=True)
     storage_location = Column(String(500), nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
 # Pydantic models for webhooks

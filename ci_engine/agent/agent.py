@@ -212,7 +212,7 @@ class Agent:
         """
         import os as os_module
         import subprocess
-        from datetime import datetime
+        from datetime import datetime, timezone
 
         print(f"Executing job #{job['id']}: {job['label']}")
         print(f"Command: {job['command']}")
@@ -247,7 +247,7 @@ class Agent:
         if self.use_websocket:
             self.connect_websocket(job_id)
 
-        start_time = datetime.utcnow()
+        start_time = datetime.now(timezone.utc)
         exit_code = -1
         stdout = ""
         stderr = ""
@@ -316,7 +316,7 @@ class Agent:
             stderr = error_msg
         finally:
             # Process through plugin post_execute hooks
-            duration_ms = int((datetime.utcnow() - start_time).total_seconds() * 1000)
+            duration_ms = int((datetime.now(timezone.utc) - start_time).total_seconds() * 1000)
             result = JobResult.from_result(
                 exit_code, stdout, stderr, timeout_seconds > 0, duration_ms
             )

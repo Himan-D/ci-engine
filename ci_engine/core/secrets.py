@@ -2,7 +2,7 @@
 # CI Engine - Secrets Management with Fernet Encryption
 
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import Column, Integer, String, DateTime, Text, Boolean
@@ -19,8 +19,12 @@ class Secret(Base):
     name = Column(String(100), unique=True, nullable=False)
     value_encrypted = Column(Text, nullable=False)
     key_version = Column(Integer, default=1)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
     created_by = Column(String(100), nullable=True)
     is_active = Column(Boolean, default=True)
 
@@ -128,7 +132,7 @@ class SecretService:
             encrypted, key_version = _encrypt_value(value)
             secret.value_encrypted = encrypted
             secret.key_version = key_version
-            secret.updated_at = datetime.utcnow()
+            secret.updated_at = datetime.now(timezone.utc)
             db.commit()
             db.refresh(secret)
         return secret

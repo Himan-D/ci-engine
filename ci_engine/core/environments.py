@@ -2,11 +2,11 @@
 # CI Engine - Environment Groups
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import Column, Integer, String, DateTime, Text
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from ci_engine.server.models import Base
 
@@ -20,8 +20,12 @@ class EnvironmentGroup(Base):
     name = Column(String(100), nullable=False, unique=True)
     description = Column(String(500), nullable=True)
     variables = Column(Text, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
     created_by = Column(Integer, nullable=True)
 
 
@@ -43,8 +47,7 @@ class EnvironmentGroupResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 def create_environment_group(
@@ -101,7 +104,7 @@ def update_environment_group(
     if variables is not None:
         group.variables = json.dumps(variables)
 
-    group.updated_at = datetime.utcnow()
+    group.updated_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(group)
     return group

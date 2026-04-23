@@ -5,7 +5,7 @@ import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, asdict
 from typing import Optional, Any
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 @dataclass
@@ -75,7 +75,7 @@ class JobResult:
         cls, exit_code: int, stdout: str, stderr: str, timed_out: bool = False, duration_ms: int = 0
     ) -> "JobResult":
         """Create result from execution data."""
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         return cls(
             exit_code=exit_code,
             stdout=stdout,

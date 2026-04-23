@@ -2,7 +2,7 @@
 # CI Engine - Job scheduler
 
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timezone
 from ci_engine.server.models import (
     Job,
     Agent,
@@ -161,7 +161,7 @@ class Scheduler:
                     if dep in j.depends_on.split(","):
                         if j.status == JobStatus.BLOCKED:
                             j.status = JobStatus.SKIPPED
-                            j.finished_at = datetime.utcnow()
+                            j.finished_at = datetime.now(timezone.utc)
 
         db.commit()
         Scheduler.update_build_status(db, build_id)
@@ -224,7 +224,7 @@ class Scheduler:
 
         job.status = JobStatus.FAILED
         job.exit_code = -1
-        job.finished_at = datetime.utcnow()
+        job.finished_at = datetime.now(timezone.utc)
 
         if job.agent:
             job.agent.status = AgentStatus.IDLE

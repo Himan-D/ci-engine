@@ -4,7 +4,7 @@
 import hashlib
 import hmac
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
 from pydantic import BaseModel
 
@@ -279,7 +279,7 @@ class WebhookEndpoint:
         self.url = url
         self.events = events
         self.secret = secret
-        self.created_at = datetime.utcnow()
+        self.created_at = datetime.now(timezone.utc)
         self.is_active = True
 
 

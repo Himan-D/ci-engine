@@ -3,7 +3,7 @@
 
 import os
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 from sqlalchemy.orm import Session
 
@@ -40,7 +40,7 @@ class ScalingTrigger:
         self.action = action
         self.reason = reason
         self.priority = priority
-        self.timestamp = datetime.utcnow()
+        self.timestamp = datetime.now(timezone.utc)
 
 
 class MetricsBackend:
@@ -65,7 +65,7 @@ class MetricsBackend:
         """Get jobs completed per minute."""
         from datetime import timedelta
 
-        cutoff = datetime.utcnow() - timedelta(seconds=window_seconds)
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=window_seconds)
         completed = (
             db.query(Job)
             .filter(Job.status.in_([JobStatus.PASSED, JobStatus.FAILED]), Job.finished_at >= cutoff)
@@ -161,7 +161,7 @@ class AutoScaler:
         idle_agents = state["agents"]["idle"]
 
         if self.last_scale_up:
-            cooldown = (datetime.utcnow() - self.last_scale_up).total_seconds()
+            cooldown = (datetime.now(timezone.utc) - self.last_scale_up).total_seconds()
             if cooldown < self.config.SCALE_UP_COOLDOWN_SECONDS:
                 return False
 
@@ -180,7 +180,7 @@ class AutoScaler:
         running_jobs = state["jobs"]["running"]
 
         if self.last_scale_down:
-            cooldown = (datetime.utcnow() - self.last_scale_down).total_seconds()
+            cooldown = (datetime.now(timezone.utc) - self.last_scale_down).total_seconds()
             if cooldown < self.config.SCALE_DOWN_COOLDOWN_SECONDS:
                 return False
 
@@ -210,7 +210,7 @@ class AutoScaler:
             )
 
         if self.evaluate_scale_up(state):
-            self.last_scale_up = datetime.utcnow()
+            self.last_scale_up = datetime.now(timezone.utc)
             return ScalingTrigger(
                 ScalingTrigger.SCALE_UP,
                 f"High job queue ({state['jobs']['pending']} pending jobs, {state['agents']['idle']} idle agents)",
@@ -218,7 +218,7 @@ class AutoScaler:
             )
 
         if self.evaluate_scale_down(state):
-            self.last_scale_down = datetime.utcnow()
+            self.last_scale_down = datetime.now(timezone.utc)
             return ScalingTrigger(
                 ScalingTrigger.SCALE_DOWN,
                 f"No active jobs ({state['jobs']['pending']} pending, {state['jobs']['running']} running)",

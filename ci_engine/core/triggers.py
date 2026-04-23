@@ -2,11 +2,11 @@
 # CI Engine - Pipeline Triggers (Scheduled Builds)
 
 import croniter
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from sqlalchemy import Column, Integer, String, DateTime, Boolean, Text
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from ci_engine.server.models import Base
 
@@ -32,7 +32,7 @@ class PipelineTrigger(Base):
     status = Column(String(20), default=TriggerStatus.ACTIVE)
     last_run = Column(DateTime, nullable=True)
     next_run = Column(DateTime, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     created_by = Column(Integer, nullable=True)
     enabled = Column(Boolean, default=True)
 
@@ -61,8 +61,7 @@ class PipelineTriggerResponse(BaseModel):
     created_at: datetime
     enabled: bool
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class TriggerScheduler:
@@ -93,7 +92,7 @@ class TriggerScheduler:
 
     def should_run(self, trigger_id: int, current_time: datetime = None) -> bool:
         """Check if trigger should run now."""
-        current_time = current_time or datetime.utcnow()
+        current_time = current_time or datetime.now(timezone.utc)
         cron = self._triggers.get(trigger_id)
 
         if not cron:
@@ -237,7 +236,7 @@ def check_and_run_triggers(db):
                 )
                 db.add(job)
 
-            trigger.last_run = datetime.utcnow()
+            trigger.last_run = datetime.now(timezone.utc)
             trigger.next_run = scheduler.get_next_run(trigger.id)
             db.commit()
 

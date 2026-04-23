@@ -3,12 +3,12 @@
 
 import os
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 from enum import Enum
 
 from sqlalchemy import Column, Integer, String, DateTime, Text
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from ci_engine.server.models import Base
 
@@ -72,7 +72,7 @@ class AuditEntry(Base):
     __tablename__ = "audit_logs"
 
     id = Column(Integer, primary_key=True)
-    timestamp = Column(DateTime, default=datetime.utcnow, nullable=False)
+    timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
     action = Column(String(100), nullable=False)
     level = Column(String(20), default=AuditLevel.INFO.value, nullable=False)
     user_id = Column(Integer, nullable=True)
@@ -112,8 +112,7 @@ class AuditLogResponse(BaseModel):
     details: Optional[dict]
     ip_address: Optional[str]
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class AuditLogger:
@@ -166,7 +165,7 @@ class AuditLogger:
         try:
             for entry_data in self._buffer:
                 entry = AuditEntry(
-                    timestamp=datetime.utcnow(),
+                    timestamp=datetime.now(timezone.utc),
                     action=entry_data.action,
                     level=entry_data.level,
                     user_id=entry_data.user_id,

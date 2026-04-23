@@ -2,7 +2,7 @@
 # CI Engine - JWT Authentication Middleware
 
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import Request, HTTPException, Depends, status
@@ -51,7 +51,7 @@ class AuthConfig:
 
 def create_access_token(user_id: int, username: str) -> str:
     """Create JWT access token."""
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     payload = {
         "sub": str(user_id),
         "exp": now + timedelta(minutes=AuthConfig.ACCESS_TOKEN_EXPIRE_MINUTES),
@@ -64,7 +64,7 @@ def create_access_token(user_id: int, username: str) -> str:
 
 def create_refresh_token(user_id: int) -> str:
     """Create JWT refresh token."""
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     payload = {
         "sub": str(user_id),
         "exp": now + timedelta(days=AuthConfig.REFRESH_TOKEN_EXPIRE_DAYS),

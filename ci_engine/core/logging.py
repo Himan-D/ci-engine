@@ -22,7 +22,7 @@ class StructuredLogger:
         """Format message with context."""
         if self.json_format:
             log_data = {
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
                 "level": "INFO",
                 "logger": self.name,
                 "message": message,

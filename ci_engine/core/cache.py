@@ -71,7 +71,7 @@ class LocalCache:
             expires_at = meta.get("expires_at")
             if expires_at:
                 expires = datetime.fromisoformat(expires_at)
-                if datetime.utcnow() > expires:
+                if datetime.now(timezone.utc) > expires:
                     self.delete(key)
                     return None
 
@@ -105,12 +105,12 @@ class LocalCache:
             size = os.path.getsize(cache_path)
 
         ttl = ttl_days or self.default_ttl_days
-        expires_at = (datetime.utcnow() + timedelta(days=ttl)).isoformat()
+        expires_at = (datetime.now(timezone.utc) + timedelta(days=ttl)).isoformat()
 
         meta = {
             "key": key,
             "size": size,
-            "created_at": datetime.utcnow().isoformat(),
+            "created_at": datetime.now(timezone.utc).isoformat(),
             "expires_at": expires_at,
             "hit_count": 0,
         }

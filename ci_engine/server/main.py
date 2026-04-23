@@ -3,7 +3,7 @@
 
 import os
 import json
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from collections import defaultdict
 
@@ -45,7 +45,7 @@ from ci_engine.core.pipeline import parse_pipeline
 from ci_engine.server.dashboard import router as dashboard_router
 from ci_engine.server.middleware import AuthenticationMiddleware
 from ci_engine.server.auth import AuthService, User, TokenResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from ci_engine.server.middleware import (
     create_access_token,
     create_refresh_token,
@@ -343,7 +343,7 @@ def register_agent(agent_data: AgentCreate, db: Session = Depends(get_db)):
     existing = db.query(Agent).filter(Agent.name == agent_data.name).first()
     if existing:
         existing.status = AgentStatus.IDLE
-        existing.last_seen = datetime.utcnow()
+        existing.last_seen = datetime.now(timezone.utc)
         if agent_data.tags:
             existing.tags = ",".join(agent_data.tags)
         if agent_data.skills:
@@ -465,7 +465,7 @@ def get_agents_metrics_summary(db: Session = Depends(get_db)):
         total_jobs_completed += completed
 
     return {
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "system": {
             "cpu_percent": round(cpu_percent, 1),
             "memory_percent": memory.percent,
@@ -862,12 +862,12 @@ def start_job(job_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Job not found")
 
     job.status = JobStatus.RUNNING
-    job.started_at = datetime.utcnow()
+    job.started_at = datetime.now(timezone.utc)
 
     build = db.query(Build).filter(Build.id == job.build_id).first()
     if build and build.status == BuildStatus.PENDING:
         build.status = BuildStatus.RUNNING
-        build.started_at = datetime.utcnow()
+        build.started_at = datetime.now(timezone.utc)
 
     db.commit()
 
@@ -886,7 +886,7 @@ def complete_job(job_id: int, exit_code: int, db: Session = Depends(get_db)):
 
     job.status = JobStatus.PASSED if exit_code == 0 else JobStatus.FAILED
     job.exit_code = exit_code
-    job.finished_at = datetime.utcnow()
+    job.finished_at = datetime.now(timezone.utc)
 
     if job.agent:
         job.agent.status = AgentStatus.IDLE
@@ -918,7 +918,7 @@ def complete_job(job_id: int, exit_code: int, db: Session = Depends(get_db)):
                     .count()
                 )
                 build.status = BuildStatus.PASSED if failed_jobs == 0 else BuildStatus.FAILED
-                build.finished_at = datetime.utcnow()
+                build.finished_at = datetime.now(timezone.utc)
 
     db.commit()
 
@@ -962,7 +962,7 @@ def cancel_job(job_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail=f"Job already {job.status.value}")
 
     job.status = JobStatus.CANCELED
-    job.finished_at = datetime.utcnow()
+    job.finished_at = datetime.now(timezone.utc)
 
     if job.agent:
         job.agent.status = AgentStatus.IDLE
@@ -987,13 +987,13 @@ def cancel_build(build_id: int, db: Session = Depends(get_db)):
     for job in jobs:
         if job.status in (JobStatus.PENDING, JobStatus.RUNNING, JobStatus.ASSIGNED):
             job.status = JobStatus.CANCELED
-            job.finished_at = datetime.utcnow()
+            job.finished_at = datetime.now(timezone.utc)
             if job.agent:
                 job.agent.status = AgentStatus.IDLE
             canceled_count += 1
 
     build.status = BuildStatus.CANCELED
-    build.finished_at = datetime.utcnow()
+    build.finished_at = datetime.now(timezone.utc)
 
     db.commit()
 
@@ -1168,7 +1168,7 @@ def get_stats(db: Session = Depends(get_db)):
     """Get CI engine statistics."""
     from datetime import datetime, timedelta
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     day_ago = now - timedelta(days=1)
 
     builds_24h = db.query(Build).filter(Build.created_at >= day_ago).count()
@@ -1223,8 +1223,7 @@ class UserResponse(BaseModel):
     role: str
     is_active: bool
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 @app.post("/api/auth/register", response_model=UserResponse, tags=["auth"])
@@ -1324,8 +1323,7 @@ class TokenListItem(BaseModel):
     last_used: Optional[datetime]
     is_active: bool
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class TokenRefreshRequest(BaseModel):
@@ -1404,13 +1402,13 @@ def cancel_build(build_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail=f"Build already {build.status}")
 
     build.status = BuildStatus.CANCELED
-    build.finished_at = datetime.utcnow()
+    build.finished_at = datetime.now(timezone.utc)
 
     jobs = db.query(Job).filter(Job.build_id == build_id).all()
     for job in jobs:
         if job.status in (JobStatus.PENDING, JobStatus.ASSIGNED, JobStatus.RUNNING):
             job.status = JobStatus.CANCELED
-            job.finished_at = datetime.utcnow()
+            job.finished_at = datetime.now(timezone.utc)
             if job.agent:
                 job.agent.status = AgentStatus.IDLE
 
@@ -1429,7 +1427,7 @@ def cancel_job(job_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail=f"Job already {job.status}")
 
     job.status = JobStatus.CANCELED
-    job.finished_at = datetime.utcnow()
+    job.finished_at = datetime.now(timezone.utc)
 
     if job.agent:
         job.agent.status = AgentStatus.IDLE
@@ -1447,7 +1445,7 @@ def cancel_job(job_id: int, db: Session = Depends(get_db)):
         build = db.query(Build).filter(Build.id == job.build_id).first()
         if build and build.status != BuildStatus.CANCELED:
             build.status = BuildStatus.FAILED
-            build.finished_at = datetime.utcnow()
+            build.finished_at = datetime.now(timezone.utc)
 
     db.commit()
     return {"status": "canceled", "job_id": job_id}
@@ -1486,7 +1484,7 @@ def agent_heartbeat(agent_id: int, db: Session = Depends(get_db)):
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
 
-    agent.last_seen = datetime.utcnow()
+    agent.last_seen = datetime.now(timezone.utc)
     agent.status = AgentStatus.IDLE
     db.commit()
     return {"status": "ok", "agent_id": agent_id}
@@ -1846,7 +1844,7 @@ def cleanup_old_builds(days: int = 30, db: Session = Depends(get_db)):
     """Clean up old builds and their data. Returns count of deleted items."""
     from datetime import timedelta
 
-    cutoff_date = datetime.utcnow() - timedelta(days=days)
+    cutoff_date = datetime.now(timezone.utc) - timedelta(days=days)
 
     old_builds = db.query(Build).filter(Build.created_at < cutoff_date).all()
     deleted_builds = len(old_builds)
@@ -1889,7 +1887,7 @@ def reap_offline_agents(timeout_minutes: int = 5, db: Session = Depends(get_db))
     """Mark agents as offline if they haven't sent a heartbeat."""
     from datetime import timedelta
 
-    cutoff = datetime.utcnow() - timedelta(minutes=timeout_minutes)
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=timeout_minutes)
 
     offline_agents = (
         db.query(Agent)
@@ -2104,7 +2102,7 @@ def rotate_secret(secret_id: int, new_value: str, db: Session = Depends(get_db))
     encrypted, version = _encrypt_value(new_value)
     secret.value_encrypted = encrypted
     secret.key_version = version + 1
-    secret.updated_at = datetime.utcnow()
+    secret.updated_at = datetime.now(timezone.utc)
 
     db.commit()
     db.refresh(secret)

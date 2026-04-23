@@ -2,11 +2,11 @@
 # CI Engine - SSH Key Management for Agents
 
 import hashlib
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import Column, Integer, String, DateTime, Text, Boolean
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from ci_engine.server.models import Base
 
@@ -22,7 +22,7 @@ class SSHKey(Base):
     fingerprint = Column(String(100), nullable=False, unique=True)
     description = Column(String(500), nullable=True)
     is_active = Column(Boolean, default=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     last_used_at = Column(DateTime, nullable=True)
     created_by = Column(Integer, nullable=True)
 
@@ -46,8 +46,7 @@ class SSHKeyResponse(BaseModel):
     created_at: datetime
     last_used_at: Optional[datetime]
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 def generate_fingerprint(public_key: str) -> str:
@@ -153,7 +152,7 @@ def mark_key_used(key_id: int, db) -> bool:
     if not key:
         return False
 
-    key.last_used_at = datetime.utcnow()
+    key.last_used_at = datetime.now(timezone.utc)
     db.commit()
     return True
 

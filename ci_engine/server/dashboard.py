@@ -128,7 +128,7 @@ def dashboard(db: Session = Depends(get_db)):
     """Render the main dashboard."""
     from datetime import datetime, timedelta
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     day_ago = now - timedelta(days=1)
 
     builds = db.query(Build).order_by(Build.created_at.desc()).limit(20).all()
