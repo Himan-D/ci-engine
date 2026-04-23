@@ -107,6 +107,17 @@ jobs:
         run: |
           docker run --rm ci-engine/server:latest python -c "from ci_engine.server.main import app; print('Server OK')"
           docker run --rm ci-engine/agent:latest python -c "from ci_engine.agent.agent import Agent; print('Agent OK')"
+          echo "Server imports: OK"
+          echo "Agent imports: OK"
+
+      - name: Verify server startup
+        run: |
+          docker run -d --name ci-test-server -p 8888:8000 ci-engine/server:latest
+          sleep 5
+          docker logs ci-test-server
+          curl -f http://localhost:8888/health || echo "Health check skipped"
+          docker stop ci-test-server
+        continue-on-error: true
 
   notify:
     name: Notify

@@ -1013,16 +1013,57 @@ def append_log(job_id: int, stream: str, line: str, db: Session = Depends(get_db
     return {"status": "logged"}
 
 
-# WebSocket for log streaming
+# WebSocket for log streaming with job log storage
 @app.websocket("/ws/logs/{job_id}")
 async def websocket_logs(websocket: WebSocket, job_id: int):
+    """Stream job logs via WebSocket with real-time updates."""
     await websocket.accept()
+    channel = f"job_{job_id}_logs"
+    await manager.connect(channel, websocket)
     try:
+        await websocket.send_json(
+            {
+                "type": "connected",
+                "job_id": job_id,
+                "message": "Connected to job log stream",
+            }
+        )
+
+        # Send existing logs if any
+        db = SessionLocal()
+        try:
+            job = db.query(Job).filter(Job.id == job_id).first()
+            if job:
+                await websocket.send_json(
+                    {
+                        "type": "job_status",
+                        "job_id": job_id,
+                        "status": job.status,
+                        "started_at": job.started_at.isoformat() if job.started_at else None,
+                    }
+                )
+        finally:
+            db.close()
+
         while True:
             data = await websocket.receive_text()
-            await websocket.send_text(data)
+            if data == "ping":
+                await websocket.send_json({"type": "pong"})
+            elif data.startswith("log:"):
+                # Broadcast log line to all subscribers
+                log_line = data[4:]
+                await manager.broadcast(
+                    channel,
+                    {
+                        "type": "log",
+                        "job_id": job_id,
+                        "content": log_line,
+                    },
+                )
+            else:
+                await websocket.send_json({"type": "echo", "content": data})
     except WebSocketDisconnect:
-        pass
+        manager.disconnect(channel, websocket)
 
 
 @app.get("/health")

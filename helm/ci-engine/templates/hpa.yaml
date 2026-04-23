@@ -1,0 +1,33 @@
+# Horizontal Pod Autoscaler for CI Engine Server
+# This will be created when autoscaling is enabled in values.yaml
+# Scale down stabilization: 5 minutes
+# Scale up stabilization: immediate
+
+# NOTE: This is a reference file. The actual HPA is created via Helm templating.
+# To use, add to your values.yaml:
+#   autoscaling:
+#     enabled: true
+#     minReplicas: 2
+#     maxReplicas: 10
+#     targetCPUUtilizationPercentage: 70
+#     targetMemoryUtilizationPercentage: 80
+
+# Example HPA manifest (for reference):
+# apiVersion: autoscaling/v2
+# kind: HorizontalPodAutoscaler
+# metadata:
+#   name: ci-engine-server-hpa
+# spec:
+#   scaleTargetRef:
+#     apiVersion: apps/v1
+#    kind: Deployment
+#     name: ci-engine-server
+#   minReplicas: 2
+#   maxReplicas: 10
+#   metrics:
+#   - type: Resource
+#     resource:
+#       name: cpu
+#       target:
+#         type: Utilization
+#         averageUtilization: 70
