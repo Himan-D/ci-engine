@@ -49,6 +49,8 @@ class Agent:
         max_memory_mb: int = 0,
         max_cpu_percent: int = 0,
         version: str = "1.0.0",
+        plugins: list | None = None,
+        middleware: list | None = None,
     ):
         self.server_url = server_url.rstrip("/")
         self.name = name
@@ -68,6 +70,20 @@ class Agent:
         self._running_jobs: dict[int, RunningJob] = {}
         self._lock = threading.Lock()
         self._resource_monitor_running = False
+
+        # Plugin system
+        self._plugins = plugins or []
+        self._middleware = None
+        if middleware:
+            from ci_engine.agent.middleware import MiddlewareChain
+
+            self._middleware = MiddlewareChain()
+            for mw in middleware:
+                self._middleware.add(mw)
+
+        # Register plugins with this agent
+        for plugin in self._plugins:
+            plugin.on_register(self)
 
     def register(self) -> bool:
         """Register this agent with the CI server."""
@@ -192,9 +208,11 @@ class Agent:
         """Execute a job and return exit code.
 
         Uses Executor class for proper isolation, timeout handling, and container support.
+        Also processes through plugin system if plugins are configured.
         """
         import os as os_module
         import subprocess
+        from datetime import datetime
 
         print(f"Executing job #{job['id']}: {job['label']}")
         print(f"Command: {job['command']}")
@@ -204,8 +222,35 @@ class Agent:
         container_image = job.get("container_image")
         timeout_seconds = job.get("timeout_seconds", 3600)
 
+        # Create job context for plugins
+        from ci_engine.agent.plugins import JobContext, JobResult, HookDispatcher
+
+        context = JobContext.from_job(job)
+        context.agent_name = self.name
+        context.agent_id = self.agent_id
+
+        # Process through middleware if available
+        if self._middleware:
+            job = self._middleware.process_pre(job)
+
+        # Process through plugin pre_execute hooks
+        dispatcher = HookDispatcher(self._plugins)
+        context = dispatcher.dispatch_pre_execute(context)
+        job["command"] = context.command
+        job["env_vars"] = context.env_vars
+        job["container_image"] = context.container_image
+        job["timeout_seconds"] = context.timeout_seconds
+        command = context.command
+        container_image = context.container_image
+        timeout_seconds = context.timeout_seconds
+
         if self.use_websocket:
             self.connect_websocket(job_id)
+
+        start_time = datetime.utcnow()
+        exit_code = -1
+        stdout = ""
+        stderr = ""
 
         try:
             if container_image:
@@ -215,13 +260,7 @@ class Agent:
                 workspace_dir = os_module.environ.get("CI_WORKSPACE", "/tmp/ci-engine-workspace")
                 os_module.makedirs(workspace_dir, exist_ok=True)
 
-                env_vars = {}
-                env_var_str = job.get("env_vars", "")
-                if env_var_str:
-                    try:
-                        env_vars = json.loads(env_var_str)
-                    except (json.JSONDecodeError, TypeError):
-                        pass
+                env_vars = context.env_vars or {}
 
                 result = execute_in_container(
                     image=container_image,
@@ -241,13 +280,7 @@ class Agent:
                     workspace=os_module.environ.get("CI_WORKSPACE", "/tmp/ci-engine-workspace")
                 )
 
-                env_vars = {}
-                env_var_str = job.get("env_vars", "")
-                if env_var_str:
-                    try:
-                        env_vars = json.loads(env_var_str)
-                    except (json.JSONDecodeError, TypeError):
-                        pass
+                env_vars = context.env_vars or {}
 
                 exit_code, stdout, stderr = executor.execute(
                     command=command,
@@ -267,24 +300,36 @@ class Agent:
         except subprocess.TimeoutExpired:
             self.send_log_ws(job_id, "stderr", f"Job timed out after {timeout_seconds}s")
             self._send_log(job_id, "stderr", f"Job timed out after {timeout_seconds}s")
-            return -1
+            exit_code = -1
+            stderr = f"Job timed out after {timeout_seconds}s"
         except ValueError as e:
             error_msg = f"Invalid command syntax: {e}"
             self.send_log_ws(job_id, "stderr", error_msg)
             self._send_log(job_id, "stderr", error_msg)
-            return -1
+            exit_code = -1
+            stderr = error_msg
         except Exception as e:
             error_msg = str(e)
             self.send_log_ws(job_id, "stderr", error_msg)
             self._send_log(job_id, "stderr", error_msg)
-            return -1
+            exit_code = -1
+            stderr = error_msg
         finally:
+            # Process through plugin post_execute hooks
+            duration_ms = int((datetime.utcnow() - start_time).total_seconds() * 1000)
+            result = JobResult.from_result(
+                exit_code, stdout, stderr, timeout_seconds > 0, duration_ms
+            )
+            result = dispatcher.dispatch_post_execute(context, result)
+
             if self.ws:
                 try:
                     self.ws.close()
                 except Exception:
                     pass
                 self.ws = None
+
+        return exit_code
 
     def _send_log(self, job_id: int, stream: str, line: str):
         """Send log line to server via HTTP."""
