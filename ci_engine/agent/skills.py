@@ -111,7 +111,7 @@ class SkillDetector:
         if self.use_cache and not force:
             cached = SkillCache.load()
             if cached:
-                self.detected_skills = cls._deserialize_skills(cached)
+                self.detected_skills = SkillDetector._deserialize_skills(cached)
                 return self.detected_skills
 
         self._parallel_detection()
