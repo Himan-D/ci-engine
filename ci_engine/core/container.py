@@ -173,8 +173,12 @@ class DockerExecutor:
             subprocess.run(
                 [self.runtime.value, "rm", "-f", container_name], capture_output=True, timeout=10
             )
-        except Exception:
-            pass
+        except subprocess.TimeoutExpired:
+            logger.warning(f"Timeout cleaning up container {container_name}")
+        except FileNotFoundError:
+            logger.debug(f"Runtime not available for cleanup")
+        except Exception as e:
+            logger.warning(f"Failed to clean up container {container_name}: {e}")
 
 
 @dataclass

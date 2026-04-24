@@ -4,6 +4,7 @@
 import os
 import smtplib
 import asyncio
+import logging
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from typing import Optional
@@ -11,6 +12,9 @@ from enum import Enum
 
 import requests
 from pydantic import BaseModel
+
+
+logger = logging.getLogger(__name__)
 
 
 class NotificationType(str, Enum):
@@ -122,15 +126,15 @@ class NotificationService:
                 elif config.type == NotificationType.DISCORD:
                     self._send_discord(config, event, data)
                 sent += 1
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Failed to send {config.type} notification: {e}")
 
         if self._email_config and event in self._email_config.events:
             try:
                 self._send_email(event, data)
                 sent += 1
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Failed to send email notification: {e}")
 
         return sent
 

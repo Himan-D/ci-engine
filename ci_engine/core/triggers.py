@@ -207,6 +207,9 @@ def get_pending_triggers(db) -> list[PipelineTrigger]:
 
 def check_and_run_triggers(db):
     """Check and execute pending triggers."""
+    import logging
+
+    logger = logging.getLogger(__name__)
     pending = get_pending_triggers(db)
 
     for trigger in pending:
@@ -240,7 +243,7 @@ def check_and_run_triggers(db):
             trigger.next_run = scheduler.get_next_run(trigger.id)
             db.commit()
 
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Failed to run trigger {trigger.id}: {e}")
 
     return len(pending)
