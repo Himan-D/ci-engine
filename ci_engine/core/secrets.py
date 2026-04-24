@@ -157,5 +157,47 @@ class SecretService:
 
     @staticmethod
     def get_build_env_vars(db, build_id: int) -> dict[str, str]:
-        """Get environment variables for a build from secrets."""
-        return {}
+        """Get environment variables for a build from secrets.
+
+        Loads secrets assigned to the build's repository and returns
+        decrypted key-value pairs for injection into the build environment.
+
+        Args:
+            db: Database session
+            build_id: Build ID to get secrets for
+
+        Returns:
+            Dictionary of decrypted secret key-value pairs
+        """
+        from ci_engine.server.models import Build
+
+        env_vars = {}
+
+        # Get the build to find its repository
+        build = db.query(Build).filter(Build.id == build_id).first()
+        if not build:
+            return {}
+
+        # Get active secrets for this repository
+        secrets = (
+            db.query(Secret)
+            .filter(
+                Secret.is_active == True,
+            )
+            .all()
+        )
+
+        # Filter secrets that should apply to this build
+        # All secrets are currently global, but we could filter by repository later
+        for secret in secrets:
+            try:
+                decrypted = _decrypt_value(secret.value_encrypted, secret.key_version)
+                env_vars[secret.name] = decrypted
+            except ValueError as e:
+                # Log but don't fail the build
+                import logging
+
+                logging.warning(f"Failed to decrypt secret {secret.name}: {e}")
+                continue
+
+        return env_vars

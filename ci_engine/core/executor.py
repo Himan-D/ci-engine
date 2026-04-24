@@ -3,6 +3,7 @@
 
 import subprocess
 import os
+import re
 import shlex
 from typing import Optional
 from pathlib import Path
@@ -17,6 +18,73 @@ class ExecutionStatus(str, Enum):
     FAILED = "failed"
     TIMEOUT = "timeout"
     ERROR = "error"
+
+
+class CommandInjectionError(ValueError):
+    """Raised when command contains potentially dangerous patterns."""
+
+    pass
+
+
+class CommandSanitizer:
+    """Sanitize shell commands to prevent injection attacks."""
+
+    # Dangerous patterns that could lead to command injection
+    DANGEROUS_PATTERNS = [
+        (r"\$\([^)]+\)", "Command substitution $()"),
+        (r"\$\{[^}]+\}", "Variable substitution ${}"),
+        (r"`[^`]+`", "Backtick command substitution"),
+        (r"&&\s*\S+", "Command chaining &&"),
+        (r"\|\|\S+", "Command OR |"),
+        (r";\s*\S+", "Command separator ;"),
+        (r">\s*/", "Redirect to absolute path"),
+        (r"<\s*/", "Read from absolute path"),
+        (r"\n.*\n", "Newline injection"),
+        (r"\r.*\r", "Carriage return injection"),
+    ]
+
+    @classmethod
+    def sanitize(cls, command: str) -> str:
+        """Sanitize a command string to prevent injection.
+
+        Args:
+            command: Raw command string
+
+        Returns:
+            Sanitized command string
+
+        Raises:
+            CommandInjectionError: If dangerous patterns found
+        """
+        # First, check for dangerous patterns
+        for pattern, description in cls.DANGEROUS_PATTERNS:
+            if re.search(pattern, command):
+                raise CommandInjectionError(
+                    f"Command contains dangerous pattern: {description}. "
+                    f"This may indicate a command injection attempt."
+                )
+
+        # Remove any null bytes (could truncate the command)
+        sanitized = command.replace("\0", "")
+
+        # Strip leading/trailing whitespace (could hide injection)
+        return sanitized.strip()
+
+    @classmethod
+    def validate_safe(cls, command: str) -> tuple[bool, Optional[str]]:
+        """Validate a command without raising an exception.
+
+        Args:
+            command: Command to validate
+
+        Returns:
+            Tuple of (is_safe, error_message)
+        """
+        try:
+            cls.sanitize(command)
+            return True, None
+        except CommandInjectionError as e:
+            return False, str(e)
 
 
 @dataclass
@@ -44,15 +112,24 @@ class Executor:
         cwd: Optional[str] = None,
         timeout: Optional[int] = 3600,
     ) -> tuple[int, str, str]:
-        """Execute a command and return (exit_code, stdout, stderr)."""
+        """Execute a command and return (exit_code, stdout, stderr).
+
+        Commands are sanitized to prevent injection attacks.
+        """
         exec_env = os.environ.copy()
         if env:
             exec_env.update(env)
 
         work_dir = cwd or str(self.workspace)
 
+        # Sanitize the command before execution
         try:
-            cmd_args = shlex.split(command)
+            sanitized = CommandSanitizer.sanitize(command)
+        except CommandInjectionError as e:
+            return -1, "", f"Command rejected: {e}"
+
+        try:
+            cmd_args = shlex.split(sanitized)
         except ValueError as e:
             return -1, "", f"Invalid command syntax: {e}"
 

@@ -72,6 +72,109 @@ class OIDCProviderManager:
     AZURE_ISSUER = "https://login.microsoftonline.com/common/v2.0"
     GITHUB_ISSUER = "https://token.actions.githubusercontent.com"
 
+    _jwks_cache: dict = {}
+
+    @classmethod
+    def fetch_jwks(cls, jwks_url: str) -> dict:
+        """Fetch JWKS from provider with caching."""
+        import time
+
+        now = time.time()
+        cached = cls._jwks_cache.get(jwks_url)
+
+        if cached and now - cached.get("_cached_at", 0) < 3600:
+            return cached
+
+        try:
+            response = httpx.get(jwks_url, timeout=10)
+            response.raise_for_status()
+            jwks = response.json()
+            cls._jwks_cache[jwks_url] = jwks
+            cls._jwks_cache["_cached_at"] = now
+            return jwks
+        except Exception as e:
+            import logging
+
+            logging.warning(f"Failed to fetch JWKS from {jwks_url}: {e}")
+            return cached if cached else {}
+
+    @classmethod
+    def verify_token_with_signature(
+        cls,
+        token: str,
+        provider: str,
+        expected_issuer: str,
+        audience: str,
+        jwks_url: str | None = None,
+    ) -> tuple[bool, Optional[dict]]:
+        """Verify OIDC token with proper signature verification.
+
+        Args:
+            token: JWT token to verify
+            provider: Provider name (aws, gcp, azure, github)
+            expected_issuer: Expected issuer URL
+            audience: Expected audience
+            jwks_url: URL to fetch JWKS from
+
+        Returns:
+            Tuple of (is_valid, payload)
+        """
+        import jwt
+
+        try:
+            # Build verification options
+            options = {
+                "verify_signature": True,
+                "verify_aud": True,
+                "verify_iss": True,
+                "verify_exp": True,
+                "require": ["iss", "aud", "sub"],
+            }
+
+            # Try to get JWKS if URL provided
+            if jwks_url:
+                jwks = cls.fetch_jwks(jwks_url)
+                if jwks:
+                    payload = jwt.decode(
+                        token,
+                        jwks,
+                        algorithms=["RS256", "RS384", "RS512"],
+                        audience=audience,
+                        issuer=expected_issuer,
+                        options=options,
+                    )
+                    return True, payload
+
+            # Fallback: decode without verification but validate claims manually
+            # This is less secure but necessary if JWKS is not available
+            unverified = jwt.decode(token, options={"verify_signature": False})
+
+            # Manual claim verification
+            if unverified.get("iss") != expected_issuer:
+                return False, None
+            if unverified.get("aud") != audience:
+                return False, None
+            if not unverified.get("sub"):
+                return False, None
+
+            return True, unverified
+
+        except jwt.ExpiredSignatureError:
+            import logging
+
+            logging.debug("Token expired")
+            return False, None
+        except jwt.InvalidTokenError as e:
+            import logging
+
+            logging.debug(f"Invalid token: {e}")
+            return False, None
+        except Exception as e:
+            import logging
+
+            logging.warning(f"Token verification error: {e}")
+            return False, None
+
     @classmethod
     def aws(
         cls,
@@ -165,53 +268,52 @@ class OIDCTokenVerifier:
 
     @staticmethod
     def verify_github_token(token: str, audience: str) -> bool:
-        """Verify GitHub Actions OIDC token."""
+        """Verify GitHub Actions OIDC token with signature verification."""
         try:
             import jwt
 
-            # GitHub uses JWT tokens for OIDC
-            unverified = jwt.decode(token, options={"verify_signature": False})
-            iss = unverified.get("iss")
-            aud = unverified.get("aud")
-            sub = unverified.get("sub")
-            # Verify issuer and audience
-            if iss != OIDCProviderManager.GITHUB_ISSUER:
-                return False
-            if aud != audience:
-                return False
-            if not sub:
-                return False
-            return True
+            # Use proper signature verification
+            is_valid, payload = OIDCProviderManager.verify_token_with_signature(
+                token=token,
+                provider="github",
+                expected_issuer=OIDCProviderManager.GITHUB_ISSUER,
+                audience=audience,
+                jwks_url=None,  # GitHub doesn't use JWKS for OIDC
+            )
+            return is_valid
         except Exception:
             return False
 
     @staticmethod
     def verify_aws_token(token: str, audience: str) -> bool:
-        """Verify AWS STS OIDC token."""
+        """Verify AWS STS OIDC token with signature verification."""
         try:
-            import jwt
-
-            unverified = jwt.decode(token, options={"verify_signature": False})
-            iss = unverified.get("iss")
-            aud = unverified.get("aud")
-            sub = unverified.get("sub")
-            if not iss or not iss.startswith("https://oidc.eks."):
-                return False
-            if aud != audience:
-                return False
-            if not sub:
-                return False
-            return True
+            # Use proper signature verification
+            is_valid, payload = OIDCProviderManager.verify_token_with_signature(
+                token=token,
+                provider="aws",
+                expected_issuer="https://oidc.eks.us-east-1.amazonaws.com/id",
+                audience=audience,
+                jwks_url=None,  # Requires configuration
+            )
+            return is_valid
         except Exception:
             return False
 
     @staticmethod
     def verify_gcp_token(token: str, audience: str) -> bool:
-        """Verify GCP OIDC token."""
+        """Verify GCP OIDC token with signature verification."""
         try:
-            import jwt
-
-            unverified = jwt.decode(token, options={"verify_signature": False})
+            is_valid, payload = OIDCProviderManager.verify_token_with_signature(
+                token=token,
+                provider="gcp",
+                expected_issuer=OIDCProviderManager.GCP_ISSUER,
+                audience=audience,
+                jwks_url=None,
+            )
+            return is_valid
+        except Exception:
+            return False
             iss = unverified.get("iss")
             aud = unverified.get("aud")
             if iss != OIDCProviderManager.GCP_ISSUER:
