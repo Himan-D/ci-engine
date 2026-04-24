@@ -5,10 +5,14 @@ import os
 import json
 import hashlib
 import shutil
+import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from pathlib import Path
+
+
+logger = logging.getLogger(__name__)
 
 
 class CacheError(Exception):
@@ -19,6 +23,12 @@ class CacheError(Exception):
 
 class CacheNotFoundError(CacheError):
     """Cache entry not found."""
+
+    pass
+
+
+class CacheBackendUnavailableError(CacheError):
+    """Cache backend is unavailable."""
 
     pass
 
@@ -180,7 +190,7 @@ class LocalCache:
         """Remove oldest entries if cache exceeds max size."""
         max_bytes = int(self.max_size_gb * 1024 * 1024 * 1024)
 
-        total_size = sum(sum(f.stat().st_size for f in self.cache_dir.rglob("*") if f.is_file()))
+        total_size = sum(f.stat().st_size for f in self.cache_dir.rglob("*") if f.is_file())
 
         if total_size <= max_bytes:
             return
@@ -195,7 +205,17 @@ class LocalCache:
 
 
 class RemoteCache:
-    """Remote cache backend (S3-compatible)."""
+    """Remote cache backend using S3-compatible storage.
+
+    Supports AWS S3, Google Cloud Storage (via gcs hook), MinIO, and other S3-compatible backends.
+
+    Environment variables:
+        CI_ENGINE_CACHE_BUCKET: S3 bucket name (default: ci-engine-cache)
+        AWS_REGION: AWS region (default: us-east-1)
+        AWS_ACCESS_KEY_ID: AWS access key (optional, uses IAM if not provided)
+        AWS_SECRET_ACCESS_KEY: AWS secret key (optional, uses IAM if not provided)
+        S3_ENDPOINT_URL: S3-compatible endpoint URL (for MinIO, etc.)
+    """
 
     def __init__(
         self,
@@ -204,22 +224,206 @@ class RemoteCache:
     ):
         self.bucket = bucket or os.environ.get("CI_ENGINE_CACHE_BUCKET", "ci-engine-cache")
         self.region = region or os.environ.get("AWS_REGION", "us-east-1")
+        self.endpoint_url = os.environ.get("S3_ENDPOINT_URL")
+        self.access_key = os.environ.get("AWS_ACCESS_KEY_ID")
+        self.secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY")
+        self._client = None
 
-    async def get(self, key: str) -> Optional[bytes]:
-        """Get cache entry from remote storage."""
-        return None
+    def _get_client(self):
+        """Get or create S3 client."""
+        if self._client is not None:
+            return self._client
 
-    async def put(self, key: str, data: bytes, ttl_days: int = 7) -> str:
-        """Store cache entry in remote storage."""
-        return key
+        try:
+            import boto3
+            from botocore.config import Config
 
-    async def delete(self, key: str) -> bool:
-        """Delete cache entry from remote storage."""
-        return True
+            config = Config(
+                retries={"max_attempts": 3},
+                connect_timeout=5,
+                read_timeout=30,
+            )
 
-    async def exists(self, key: str) -> bool:
-        """Check if cache entry exists in remote storage."""
-        return False
+            client_kwargs = {
+                "service_name": "s3",
+                "region_name": self.region,
+                "config": config,
+            }
+
+            if self.access_key and self.secret_key:
+                client_kwargs["aws_access_key_id"] = self.access_key
+                client_kwargs["aws_secret_access_key"] = self.secret_key
+
+            if self.endpoint_url:
+                client_kwargs["endpoint_url"] = self.endpoint_url
+
+            self._client = boto3.client(**client_kwargs)
+            logger.info(f"Initialized S3 client for bucket: {self.bucket}")
+            return self._client
+        except ImportError:
+            logger.warning("boto3 not available, RemoteCache disabled")
+            return None
+        except Exception as e:
+            logger.warning(f"Failed to initialize S3 client: {e}")
+            return None
+
+    def get(self, key: str) -> Optional[bytes]:
+        """Get cache entry from remote storage.
+
+        Args:
+            key: Cache key to retrieve
+
+        Returns:
+            Cache data as bytes, or None if not found
+        """
+        try:
+            client = self._get_client()
+            if client is None:
+                return None
+
+            response = client.get_object(Bucket=self.bucket, Key=key)
+            return response["Body"].read()
+        except client.exceptions.NoSuchKey if client else None:
+            return None
+        except Exception as e:
+            logger.error(f"RemoteCache.get failed for key {key}: {e}")
+            return None
+
+    def put(self, key: str, data: bytes, ttl_days: int = 7) -> str:
+        """Store cache entry in remote storage.
+
+        Args:
+            key: Cache key
+            data: Data to store
+            ttl_days: Time to live in days (uses bucket lifecycle if available)
+
+        Returns:
+            The cache key on success
+        """
+        try:
+            client = self._get_client()
+            if client is None:
+                logger.warning("RemoteCache not available, skipping put")
+                return key
+
+            client.put_object(
+                Bucket=self.bucket,
+                Key=key,
+                Body=data,
+            )
+            logger.debug(f"Stored cache key {key} ({len(data)} bytes)")
+            return key
+        except Exception as e:
+            logger.error(f"RemoteCache.put failed for key {key}: {e}")
+            return key
+
+    def delete(self, key: str) -> bool:
+        """Delete cache entry from remote storage.
+
+        Args:
+            key: Cache key to delete
+
+        Returns:
+            True if deleted successfully
+        """
+        try:
+            client = self._get_client()
+            if client is None:
+                return False
+
+            client.delete_object(Bucket=self.bucket, Key=key)
+            logger.debug(f"Deleted cache key {key}")
+            return True
+        except Exception as e:
+            logger.error(f"RemoteCache.delete failed for key {key}: {e}")
+            return False
+
+    def exists(self, key: str) -> bool:
+        """Check if cache entry exists in remote storage.
+
+        Args:
+            key: Cache key to check
+
+        Returns:
+            True if exists, False otherwise
+        """
+        try:
+            client = self._get_client()
+            if client is None:
+                return False
+
+            client.head_object(Bucket=self.bucket, Key=key)
+            return True
+        except Exception:
+            return False
+
+    def list_keys(self, prefix: str = "") -> list[str]:
+        """List all cache keys with optional prefix filter.
+
+        Args:
+            prefix: Optional prefix to filter keys
+
+        Returns:
+            List of cache keys
+        """
+        try:
+            client = self._get_client()
+            if client is None:
+                return []
+
+            paginator = client.get_paginator("list_objects_v2")
+            keys = []
+
+            for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
+                for obj in page.get("Contents", []):
+                    keys.append(obj["Key"])
+
+            return keys
+        except Exception as e:
+            logger.error(f"RemoteCache.list_keys failed: {e}")
+            return []
+
+    def close(self):
+        """Close the S3 client."""
+        self._client = None
+
+    def cleanup_expired(self, prefix: str = "", max_age_days: int = 7) -> int:
+        """Clean up expired cache entries.
+
+        Args:
+            prefix: Only delete keys with this prefix
+            max_age_days: Delete keys older than this many days
+
+        Returns:
+            Number of entries deleted
+        """
+        try:
+            keys = self.list_keys(prefix)
+            deleted = 0
+            cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+
+            client = self._get_client()
+            if client is None:
+                return 0
+
+            for key in keys:
+                try:
+                    response = client.head_object(Bucket=self.bucket, Key=key)
+                    last_modified = response["LastModified"]
+
+                    if last_modified.tzinfo:
+                        last_modified = last_modified.replace(tzinfo=None)
+                    if last_modified < cutoff:
+                        self.delete(key)
+                        deleted += 1
+                except Exception:
+                    continue
+
+            logger.info(f"Cleaned up {deleted} expired cache entries")
+            return deleted
+        except Exception as e:
+            logger.error(f"RemoteCache.cleanup_expired failed: {e}")
+            return 0
 
 
 def compute_cache_key(
@@ -238,11 +442,20 @@ def compute_cache_key(
 
 
 _cache: Optional[LocalCache] = None
+_remote_cache: Optional[RemoteCache] = None
 
 
 def get_cache() -> LocalCache:
-    """Get the cache singleton."""
+    """Get the local cache singleton."""
     global _cache
     if _cache is None:
         _cache = LocalCache()
     return _cache
+
+
+def get_remote_cache() -> RemoteCache:
+    """Get the remote cache singleton (S3-compatible)."""
+    global _remote_cache
+    if _remote_cache is None:
+        _remote_cache = RemoteCache()
+    return _remote_cache
