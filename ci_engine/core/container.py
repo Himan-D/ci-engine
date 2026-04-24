@@ -176,6 +176,203 @@ class DockerExecutor:
         except Exception:
             pass
 
+
+@dataclass
+class ServiceConfig:
+    """Configuration for a service container (sidecar)."""
+
+    name: str
+    image: str
+    env_vars: Optional[Dict[str, str]] = None
+    ports: Optional[list[str]] = None
+    healthcheck: Optional[str] = None
+
+
+class ServiceContainerManager:
+    """Manages service containers for build jobs.
+
+    Supports starting PostgreSQL, Redis, MySQL, and other services
+    alongside build jobs.
+
+    Usage:
+        manager = ServiceContainerManager()
+
+        # Start services before job
+        services = [
+            ServiceConfig(name="db", image="postgres:15", env_vars={"POSTGRES_PASSWORD": "test"}),
+            ServiceConfig(name="cache", image="redis:7"),
+        ]
+        await manager.start_services(services, build_id=123)
+
+        # Get connection info
+        db_url = manager.get_connection_url("db", "postgres")
+        # -> postgresql://postgres:test@localhost:5432
+
+        # After job completes
+        await manager.stop_services()
+    """
+
+    def __init__(self, runtime: ContainerRuntime = ContainerRuntime.DOCKER):
+        self.runtime = runtime
+        self._active_services: Dict[str, str] = {}  # name -> container_id
+
+    async def start_services(
+        self,
+        services: list[ServiceConfig],
+        build_id: int,
+    ) -> Dict[str, str]:
+        """Start service containers.
+
+        Args:
+            services: List of service configurations
+            build_id: Build ID for container naming
+
+        Returns:
+            Dict mapping service name to container ID
+        """
+        results = {}
+
+        for svc in services:
+            container_name = f"ci-engine-svc-{build_id}-{svc.name}"
+
+            try:
+                cmd = [
+                    self.runtime.value,
+                    "run",
+                    "--name",
+                    container_name,
+                    "--rm",
+                    "-d",  # Detached mode
+                ]
+
+                # Add environment variables
+                if svc.env_vars:
+                    for key, value in svc.env_vars.items():
+                        cmd.extend(["-e", f"{key}={value}"])
+
+                # Add port mappings
+                if svc.ports:
+                    for port in svc.ports:
+                        cmd.extend(["-p", port])
+
+                cmd.append(svc.image)
+
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+
+                if result.returncode == 0:
+                    self._active_services[svc.name] = container_name
+                    results[svc.name] = container_name
+                    logger.info(f"Started service {svc.name} in container {container_name}")
+                else:
+                    logger.error(f"Failed to start service {svc.name}: {result.stderr}")
+
+            except Exception as e:
+                logger.error(f"Error starting service {svc.name}: {e}")
+
+        return results
+
+    def get_connection_url(
+        self,
+        service_name: str,
+        service_type: str = "postgres",
+    ) -> Optional[str]:
+        """Get connection URL for a service.
+
+        Args:
+            service_name: Name of the service
+            service_type: Type of service (postgres, redis, mysql, mongo)
+
+        Returns:
+            Connection URL string, or None if service not found
+        """
+        if service_name not in self._active_services:
+            return None
+
+        # Get port mappings from running container
+        try:
+            cmd = [
+                self.runtime.value,
+                "port",
+                self._active_services[service_name],
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+
+            port_mappings = {}
+            for line in result.stdout.strip().split("\n"):
+                if ":" in line:
+                    host_port, container_port = line.split(":")
+                    port_mappings[container_port] = host_port
+
+            # Determine default port and return connection URL
+            ports = {
+                "postgres": ("5432", "postgresql", "postgres", "test"),
+                "redis": ("6379", "redis", "", ""),
+                "mysql": ("3306", "mysql", "root", "test"),
+                "mongo": ("27017", "mongodb", "root", "test"),
+            }
+
+            if service_type not in ports:
+                return None
+
+            default_port, scheme, user, password = ports[service_type]
+            host_port = port_mappings.get(default_port, default_port)
+
+            if service_type == "redis":
+                return f"redis://localhost:{host_port}"
+            elif service_type == "mongo":
+                return f"mongodb://{user}:{password}@localhost:{host_port}"
+            else:
+                return f"{scheme}://{user}:{password}@localhost:{host_port}"
+
+        except Exception as e:
+            logger.error(f"Error getting connection URL for {service_name}: {e}")
+            return None
+
+    async def stop_services(self) -> None:
+        """Stop all active service containers."""
+        for service_name, container_id in self._active_services.items():
+            try:
+                subprocess.run(
+                    [self.runtime.value, "rm", "-f", container_id],
+                    capture_output=True,
+                    timeout=10,
+                )
+                logger.info(f"Stopped service container {container_id}")
+            except Exception as e:
+                logger.error(f"Error stopping service {service_name}: {e}")
+
+        self._active_services.clear()
+
+    def get_service_ip(self, service_name: str) -> Optional[str]:
+        """Get the IP address of a service container.
+
+        Args:
+            service_name: Name of the service
+
+        Returns:
+            IP address, or None if service not found
+        """
+        if service_name not in self._active_services:
+            return None
+
+        try:
+            cmd = [
+                self.runtime.value,
+                "inspect",
+                "-f",
+                "{{.NetworkSettings.IPAddress}}",
+                self._active_services[service_name],
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+            return result.stdout.strip() if result.returncode == 0 else None
+        except Exception:
+            return None
+
     def pull_image(self, image: str) -> bool:
         """Pull a container image."""
         try:

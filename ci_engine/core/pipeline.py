@@ -179,6 +179,30 @@ def _expand_matrix_steps(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return expanded
 
 
+def _normalize_services(services: Any) -> list[dict[str, Any]]:
+    """Normalize service definitions."""
+    if not services:
+        return []
+
+    if isinstance(services, list):
+        normalized = []
+        for svc in services:
+            if isinstance(svc, str):
+                normalized.append({"name": svc, "image": svc})
+            elif isinstance(svc, dict):
+                normalized.append(
+                    {
+                        "name": svc.get("name", ""),
+                        "image": svc.get("image", ""),
+                        "env": svc.get("env", {}),
+                        "ports": svc.get("ports", []),
+                    }
+                )
+        return normalized
+
+    return []
+
+
 def _normalize_step(step: dict[str, Any], step_type: str) -> dict[str, Any]:
     """Normalize a step to have consistent structure."""
     normalized = dict(step)
@@ -191,6 +215,29 @@ def _normalize_step(step: dict[str, Any], step_type: str) -> dict[str, Any]:
             normalized["depends_on"] = depends_on
         else:
             normalized["depends_on"] = []
+
+    # Handle cache configuration
+    cache = step.get("cache")
+    if cache:
+        if isinstance(cache, dict):
+            normalized["cache"] = {
+                "key": cache.get("key", ""),
+                "path": cache.get("path", ""),
+                "enabled": True,
+            }
+        elif isinstance(cache, str):
+            normalized["cache"] = {
+                "key": cache,
+                "path": "",
+                "enabled": True,
+            }
+        else:
+            normalized["cache"] = {"enabled": False}
+
+    # Handle services configuration
+    services = step.get("services")
+    if services:
+        normalized["services"] = _normalize_services(services)
 
     if step_type == StepType.WAIT:
         normalized["step_type"] = StepType.WAIT

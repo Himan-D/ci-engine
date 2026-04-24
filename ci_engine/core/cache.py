@@ -441,6 +441,162 @@ def compute_cache_key(
     return hashlib.sha256(combined.encode()).hexdigest()
 
 
+def compute_step_cache_key(
+    build_id: int,
+    step_key: str,
+    branch: str = "main",
+) -> str:
+    """Compute cache key for a pipeline step.
+
+    This enables cross-step caching by computing a consistent key
+    based on the step configuration and branch.
+
+    Args:
+        build_id: Build ID
+        step_key: Unique identifier for the step (e.g., "npm-deps")
+        branch: Git branch name
+
+    Returns:
+        Cache key string
+    """
+    components = [str(build_id), step_key, branch]
+    combined = "|".join(components)
+    return f"cache/{build_id}/{step_key}/{hashlib.sha256(combined.encode()).hexdigest()[:16]}"
+
+
+class BuildCacheManager:
+    """Manages cross-step cache for builds.
+
+    Usage:
+        manager = BuildCacheManager(build_id=123, branch="main")
+
+        # Check if cache exists for step
+        if await manager.restore("npm-deps"):
+            # Use cached node_modules
+            pass
+
+        # After step completes, save cache
+        await manager.save("npm-deps", "/path/to/node_modules")
+    """
+
+    def __init__(
+        self, build_id: int, branch: str = "main", remote_cache: RemoteCache | None = None
+    ):
+        self.build_id = build_id
+        self.branch = branch
+        self.remote_cache = remote_cache or get_remote_cache()
+        self.local_cache = get_cache()
+
+    async def restore(self, step_key: str, path: str) -> bool:
+        """Restore cache for a step.
+
+        Args:
+            step_key: Unique identifier for the step
+            path: Local path to restore cache to
+
+        Returns:
+            True if cache was restored
+        """
+        cache_key = compute_step_cache_key(self.build_id, step_key, self.branch)
+
+        # Try remote first
+        try:
+            data = self.remote_cache.get(cache_key)
+            if data:
+                import tempfile
+                import tarfile
+                import io
+
+                with tempfile.NamedTemporaryFile(delete=False) as tmp:
+                    tmp.write(data)
+                    tmp.flush()
+
+                    with tarfile.open(tmp.name, "r:gz") as tar:
+                        tar.extractall(path)
+
+                logger.info(f"Restored cache for step {step_key} from remote")
+                return True
+        except Exception as e:
+            logger.debug(f"Remote cache restore failed: {e}")
+
+        # Try local cache
+        local_path = self.local_cache.get(cache_key)
+        if local_path and os.path.exists(local_path):
+            import shutil
+
+            shutil.copytree(local_path, path, dirs_exist_ok=True)
+            logger.info(f"Restored cache for step {step_key} from local")
+            return True
+
+        return False
+
+    async def save(self, step_key: str, path: str) -> bool:
+        """Save cache for a step.
+
+        Args:
+            step_key: Unique identifier for the step
+            path: Local path to cache
+
+        Returns:
+            True if cache was saved
+        """
+        if not os.path.exists(path):
+            return False
+
+        cache_key = compute_step_cache_key(self.build_id, step_key, self.branch)
+
+        # Save to remote
+        try:
+            import tempfile
+            import tarfile
+            import io
+
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".tar.gz") as tmp:
+                with tarfile.open(tmp.name, "w:gz") as tar:
+                    tar.add(path, arcname=os.path.basename(path))
+                tmp.flush()
+
+                with open(tmp.name, "rb") as f:
+                    data = f.read()
+
+            self.remote_cache.put(cache_key, data)
+            logger.info(f"Saved cache for step {step_key} to remote")
+        except Exception as e:
+            logger.debug(f"Remote cache save failed: {e}")
+
+        # Also save to local
+        try:
+            self.local_cache.put(cache_key, path)
+            logger.info(f"Saved cache for step {step_key} to local")
+        except Exception as e:
+            logger.debug(f"Local cache save failed: {e}")
+
+        return True
+
+    async def clear(self) -> bool:
+        """Clear all cache for this build.
+
+        Returns:
+            True if cleared
+        """
+        cache_prefix = f"cache/{self.build_id}/"
+
+        try:
+            keys = self.remote_cache.list_keys(cache_prefix)
+            for key in keys:
+                self.remote_cache.delete(key)
+        except Exception:
+            pass
+
+        local_entries = self.local_cache.list()
+        for entry in local_entries:
+            if str(self.build_id) in entry.key:
+                self.local_cache.delete(entry.key)
+
+        logger.info(f"Cleared cache for build {self.build_id}")
+        return True
+
+
 _cache: Optional[LocalCache] = None
 _remote_cache: Optional[RemoteCache] = None
 
