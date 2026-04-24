@@ -7,6 +7,7 @@ import bcrypt
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+from fastapi import Depends, HTTPException, status
 from sqlalchemy import Column, Integer, String, DateTime, Boolean
 from pydantic import BaseModel, ConfigDict
 
@@ -303,6 +304,44 @@ class Permission:
     @staticmethod
     def can_create_tokens(role: str) -> bool:
         return role in (Permission.ADMIN, Permission.DEVELOPER)
+
+    @staticmethod
+    def has_permission(role: str, permission: str) -> bool:
+        """Check if a role has a specific permission."""
+        if permission == Permission.ADMIN:
+            return role == Permission.ADMIN
+        elif permission == Permission.DEVELOPER:
+            return role in (Permission.ADMIN, Permission.DEVELOPER)
+        elif permission == Permission.VIEWER:
+            return role in (Permission.ADMIN, Permission.DEVELOPER, Permission.VIEWER)
+        return False
+
+
+class RequirePermission:
+    """FastAPI dependency for requiring specific permissions.
+
+    This is a simple permission checker. For full integration,
+    use the dependency in main.py: Depends(RequirePermission("admin"))
+
+    Usage:
+        from ci_engine.server.auth import RequirePermission
+
+        @app.delete("/api/secrets/{id}", dependencies=[Depends(RequirePermission("admin"))])
+        def delete_secret(...):
+    """
+
+    def __init__(self, permission: str):
+        self.permission = permission
+
+    def verify(self, role: str) -> bool:
+        """Check if a role has the required permission."""
+        if self.permission == Permission.ADMIN:
+            return role == Permission.ADMIN
+        elif self.permission == Permission.DEVELOPER:
+            return role in (Permission.ADMIN, Permission.DEVELOPER)
+        elif self.permission == Permission.VIEWER:
+            return role in (Permission.ADMIN, Permission.DEVELOPER, Permission.VIEWER)
+        return False
 
 
 class PasswordValidationError(Exception):

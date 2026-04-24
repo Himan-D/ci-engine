@@ -2078,8 +2078,15 @@ def update_secret(secret_id: int, value: str, db: Session = Depends(get_db)):
 
 
 @app.delete("/api/secrets/{secret_id}", tags=["secrets"])
-def delete_secret(secret_id: int, db: Session = Depends(get_db)):
-    """Delete a secret (soft delete)."""
+def delete_secret(
+    secret_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Delete a secret (soft delete). Requires admin permission."""
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Requires admin permission")
+
     secret = db.query(Secret).filter(Secret.id == secret_id).first()
     if not secret:
         raise HTTPException(status_code=404, detail="Secret not found")
@@ -2091,8 +2098,16 @@ def delete_secret(secret_id: int, db: Session = Depends(get_db)):
 
 
 @app.post("/api/secrets/{secret_id}/rotate", response_model=SecretResponse, tags=["secrets"])
-def rotate_secret(secret_id: int, new_value: str, db: Session = Depends(get_db)):
-    """Rotate a secret with a new value."""
+def rotate_secret(
+    secret_id: int,
+    new_value: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Rotate a secret with a new value. Requires admin permission."""
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Requires admin permission")
+
     from ci_engine.core.secrets import _encrypt_value
 
     secret = db.query(Secret).filter(Secret.id == secret_id).first()
