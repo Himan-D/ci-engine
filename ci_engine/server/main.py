@@ -336,6 +336,32 @@ def get_build(build_id: int, db: Session = Depends(get_db)):
     return build
 
 
+@app.get("/api/builds/{build_id}/jobs", tags=["jobs"])
+def get_build_jobs(build_id: int, db: Session = Depends(get_db)):
+    """Get all jobs for a build."""
+    build = db.query(Build).filter(Build.id == build_id).first()
+    if not build:
+        raise HTTPException(status_code=404, detail="Build not found")
+
+    jobs = db.query(Job).filter(Job.build_id == build_id).order_by(Job.step_index).all()
+
+    return [
+        {
+            "id": job.id,
+            "build_id": job.build_id,
+            "step_index": job.step_index,
+            "label": job.label,
+            "command": job.command,
+            "status": job.status.value if job.status else None,
+            "exit_code": job.exit_code,
+            "agent_id": job.agent_id,
+            "started_at": job.started_at.isoformat() if job.started_at else None,
+            "finished_at": job.finished_at.isoformat() if job.finished_at else None,
+        }
+        for job in jobs
+    ]
+
+
 # Agent endpoints
 @app.post("/api/agents/register", response_model=AgentResponse)
 def register_agent(agent_data: AgentCreate, db: Session = Depends(get_db)):
@@ -2141,3 +2167,198 @@ def get_secret_value(secret_id: int, db: Session = Depends(get_db)):
         return {"value": value}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to decrypt: {str(e)}")
+
+
+# Environment Groups API
+@app.get(
+    "/api/environments", response_model=list["EnvironmentGroupResponse"], tags=["environments"]
+)
+def list_environments(db: Session = Depends(get_db)):
+    """List all environment groups."""
+    groups = db.query(EnvironmentGroup).all()
+    for group in groups:
+        group.variables = (
+            json.loads(group.variables) if isinstance(group.variables, str) else group.variables
+        )
+    return groups
+
+
+@app.post("/api/environments", response_model="EnvironmentGroupResponse", tags=["environments"])
+def create_environment(
+    group_data: "EnvironmentGroupCreate",
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Create a new environment group. Requires admin permission."""
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Requires admin permission")
+
+    import json as json_module
+
+    variables_json = json_module.dumps(group_data.variables)
+
+    group = EnvironmentGroup(
+        name=group_data.name,
+        description=group_data.description,
+        variables=variables_json,
+        created_by=current_user.username,
+    )
+    db.add(group)
+    db.commit()
+    db.refresh(group)
+
+    group.variables = group_data.variables
+    return group
+
+
+@app.get(
+    "/api/environments/{group_id}", response_model="EnvironmentGroupResponse", tags=["environments"]
+)
+def get_environment(group_id: int, db: Session = Depends(get_db)):
+    """Get environment group by ID."""
+    group = db.query(EnvironmentGroup).filter(EnvironmentGroup.id == group_id).first()
+    if not group:
+        raise HTTPException(status_code=404, detail="Environment group not found")
+
+    group.variables = (
+        json.loads(group.variables) if isinstance(group.variables, str) else group.variables
+    )
+    return group
+
+
+@app.put(
+    "/api/environments/{group_id}", response_model="EnvironmentGroupResponse", tags=["environments"]
+)
+def update_environment(
+    group_id: int,
+    group_data: "EnvironmentGroupCreate",
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Update environment group. Requires admin permission."""
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Requires admin permission")
+
+    group = db.query(EnvironmentGroup).filter(EnvironmentGroup.id == group_id).first()
+    if not group:
+        raise HTTPException(status_code=404, detail="Environment group not found")
+
+    import json as json_module
+
+    group.name = group_data.name
+    group.description = group_data.description
+    group.variables = json_module.dumps(group_data.variables)
+    group.updated_at = datetime.now(timezone.utc)
+
+    db.commit()
+    db.refresh(group)
+
+    group.variables = group_data.variables
+    return group
+
+
+@app.delete("/api/environments/{group_id}", tags=["environments"])
+def delete_environment(
+    group_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Delete environment group. Requires admin permission."""
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Requires admin permission")
+
+    group = db.query(EnvironmentGroup).filter(EnvironmentGroup.id == group_id).first()
+    if not group:
+        raise HTTPException(status_code=404, detail="Environment group not found")
+
+    db.delete(group)
+    db.commit()
+
+    return {"status": "deleted", "group_id": group_id}
+
+
+# Triggers API
+@app.get("/api/triggers", response_model=list["PipelineTriggerResponse"], tags=["triggers"])
+def list_triggers(db: Session = Depends(get_db)):
+    """List all pipeline triggers."""
+    triggers = db.query(PipelineTrigger).all()
+    return triggers
+
+
+@app.post("/api/triggers", response_model="PipelineTriggerResponse", tags=["triggers"])
+def create_trigger(
+    trigger_data: "PipelineTriggerCreate",
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Create a new pipeline trigger. Requires admin permission."""
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Requires admin permission")
+
+    trigger = PipelineTrigger(
+        name=trigger_data.name,
+        pipeline=trigger_data.pipeline,
+        branch=trigger_data.branch,
+        cron_expression=trigger_data.cron_expression,
+        enabled=trigger_data.enabled,
+    )
+    db.add(trigger)
+    db.commit()
+    db.refresh(trigger)
+    return trigger
+
+
+@app.get("/api/triggers/{trigger_id}", response_model="PipelineTriggerResponse", tags=["triggers"])
+def get_trigger(trigger_id: int, db: Session = Depends(get_db)):
+    """Get trigger by ID."""
+    trigger = db.query(PipelineTrigger).filter(PipelineTrigger.id == trigger_id).first()
+    if not trigger:
+        raise HTTPException(status_code=404, detail="Trigger not found")
+    return trigger
+
+
+@app.put("/api/triggers/{trigger_id}", response_model="PipelineTriggerResponse", tags=["triggers"])
+def update_trigger(
+    trigger_id: int,
+    trigger_data: "PipelineTriggerCreate",
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Update trigger. Requires admin permission."""
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Requires admin permission")
+
+    trigger = db.query(PipelineTrigger).filter(PipelineTrigger.id == trigger_id).first()
+    if not trigger:
+        raise HTTPException(status_code=404, detail="Trigger not found")
+
+    trigger.name = trigger_data.name
+    trigger.pipeline = trigger_data.pipeline
+    trigger.branch = trigger_data.branch
+    trigger.cron_expression = trigger_data.cron_expression
+    trigger.enabled = trigger_data.enabled
+    trigger.updated_at = datetime.now(timezone.utc)
+
+    db.commit()
+    db.refresh(trigger)
+    return trigger
+
+
+@app.delete("/api/triggers/{trigger_id}", tags=["triggers"])
+def delete_trigger(
+    trigger_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Delete trigger. Requires admin permission."""
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Requires admin permission")
+
+    trigger = db.query(PipelineTrigger).filter(PipelineTrigger.id == trigger_id).first()
+    if not trigger:
+        raise HTTPException(status_code=404, detail="Trigger not found")
+
+    db.delete(trigger)
+    db.commit()
+
+    return {"status": "deleted", "trigger_id": trigger_id}
