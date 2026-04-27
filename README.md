@@ -23,6 +23,7 @@ A modern, extensible CI/CD platform built with Python, designed for AI agent col
 - [Testing](#testing)
 - [Code Style](#code-style)
 - [Deployment](#deployment)
+- [Production Deployment](#production-deployment)
 - [Contributing](#contributing)
 - [Roadmap](#roadmap)
 
@@ -847,6 +848,81 @@ steps:
 - [ ] Plugin marketplace
 - [ ] SaaS offering
 - [ ] Native Kubernetes operator
+
+---
+
+## Production Deployment
+
+### Environment Variables
+
+```bash
+# Required
+DATABASE_URL=postgresql://user:pass@localhost:5432/ci_engine
+CI_ENGINE_JWT_SECRET_KEY=your-secret-key
+
+# Optional - S3 Artifacts
+CI_ENGINE_S3_BUCKET=ci-engine-artifacts
+AWS_ACCESS_KEY_ID=xxx
+AWS_SECRET_ACCESS_KEY=xxx
+
+# Optional - Notifications
+SLACK_WEBHOOK_URL=https://hooks.slack.com/...
+DISCORD_WEBHOOK_URL=https://discord.com/...
+
+# Optional - Security
+CI_ENGINE_ENCRYPTION_KEY=32-byte-base64-key
+AWS_OIDC_ISSUER=https://login.example.com
+```
+
+### Docker
+
+```bash
+# Build
+docker build -f Dockerfile.server -t ci-engine/server:latest .
+docker build -f Dockerfile.agent -t ci-engine/agent:latest .
+
+# Run
+docker run -d -p 8000:8000 \
+  -e DATABASE_URL="$DATABASE_URL" \
+  -e CI_ENGINE_JWT_SECRET_KEY="$JWT_SECRET" \
+  ci-engine/server:latest
+```
+
+### Kubernetes
+
+```bash
+# Apply manifests
+kubectl apply -k k8s/
+
+# Or apply individually
+kubectl apply -f k8s/infra.yaml
+kubectl apply -f k8s/server-deployment.yaml
+kubectl apply -f k8s/agent-deployment.yaml
+
+# Check status
+kubectl get pods -l app=ci-engine
+kubectl get svc ci-engine-server
+```
+
+### Monitoring
+
+```bash
+# Port-forward Grafana
+kubectl port-forward svc/grafana 3000:3000
+
+# View Prometheus
+kubectl port-forward svc/prometheus 9090:9090
+```
+
+### Backup
+
+```bash
+# Manual backup
+./scripts/backup/backup.sh
+
+# Restore
+./scripts/backup/restore.sh database -t 20240427_020000
+```
 
 ---
 
