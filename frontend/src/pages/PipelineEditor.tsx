@@ -11,6 +11,7 @@ import '@xyflow/react/dist/style.css';
 import StepNode from '../components/StepNode';
 import { usePipelineStore } from '../hooks/usePipelineStore';
 import { Pipeline } from '../types/pipeline';
+import { pipelineApi } from '../api/client';
 
 const nodeTypes = {
   step: StepNode,
@@ -46,7 +47,6 @@ export default function PipelineEditor({
     onConnect,
     loadFromYAML,
     toPipeline,
-    selectedNodeId,
     setSelectedNode,
   } = usePipelineStore();
 
@@ -84,10 +84,17 @@ export default function PipelineEditor({
     }
   }, [loadFromYAML]);
 
-  const handleSave = useCallback(() => {
-    const pipeline = toPipeline();
-    onSave?.(pipeline);
-  }, [toPipeline, onSave]);
+  const handleSave = useCallback(async () => {
+    try {
+      const pipeline = toPipeline();
+      const build = await pipelineApi.create(pipelineToYaml(pipeline));
+      alert(`Build #${build.id} created!`);
+      onSave?.(pipeline);
+    } catch (e) {
+      console.error('Failed to create build:', e);
+      alert('Failed to create build. Check console for details.');
+    }
+  }, [toPipeline, pipelineToYaml]);
 
   return (
     <div style={{ width: '100%', height: '100%', display: 'flex' }}>

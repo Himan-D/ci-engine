@@ -1,9 +1,38 @@
-import { StrictMode } from 'react';
+import { StrictMode, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import PipelineEditor from './pages/PipelineEditor';
+import BuildList from './pages/BuildList';
+import BuildGraph from './pages/BuildGraph';
+import AgentStatus from './pages/AgentStatus';
 import './index.css';
 
+type Tab = 'pipeline' | 'builds' | 'graph' | 'agents';
+
 function App() {
+  const [activeTab, setActiveTab] = useState<Tab>('pipeline');
+
+  const tabs: { id: Tab; label: string }[] = [
+    { id: 'pipeline', label: 'Pipeline Editor' },
+    { id: 'builds', label: 'Builds' },
+    { id: 'graph', label: 'Build Graph' },
+    { id: 'agents', label: 'Agents' },
+  ];
+
+  const renderContent = () => {
+    switch (activeTab) {
+      case 'pipeline':
+        return <PipelineEditor />;
+      case 'builds':
+        return <BuildList />;
+      case 'graph':
+        return <BuildGraph />;
+      case 'agents':
+        return <AgentStatus />;
+      default:
+        return <PipelineEditor />;
+    }
+  };
+
   return (
     <div style={{ width: '100vw', height: '100vh', display: 'flex', flexDirection: 'column' }}>
       <header
@@ -19,19 +48,29 @@ function App() {
         <h1 style={{ color: '#fff', margin: 0, fontSize: 18 }}>
           CI Engine
         </h1>
-        <span style={{ color: '#666', fontSize: 12 }}>
-          Pipeline Editor
-        </span>
+        <nav style={{ display: 'flex', gap: 4 }}>
+          {tabs.map((tab) => (
+            <button
+              key={tab.id}
+              onClick={() => setActiveTab(tab.id)}
+              style={{
+                padding: '8px 16px',
+                background: activeTab === tab.id ? '#333' : 'transparent',
+                border: 'none',
+                borderRadius: 4,
+                color: activeTab === tab.id ? '#fff' : '#888',
+                cursor: 'pointer',
+                fontSize: 13,
+                transition: 'all 0.2s',
+              }}
+            >
+              {tab.label}
+            </button>
+          ))}
+        </nav>
       </header>
-      
-      <main style={{ flex: 1 }}>
-        <PipelineEditor
-          onSave={(pipeline) => {
-            console.log('Saving pipeline:', pipeline);
-            alert('Pipeline saved! Check console for output.');
-          }}
-        />
-      </main>
+
+      <main style={{ flex: 1, overflow: 'hidden' }}>{renderContent()}</main>
     </div>
   );
 }

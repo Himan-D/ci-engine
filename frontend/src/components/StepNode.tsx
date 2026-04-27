@@ -26,8 +26,8 @@ const statusLabels: Record<StepStatus, string> = {
 };
 
 function StepNode({ data, selected }: NodeProps) {
-  const stepData = data as StepNodeData;
-  const status = stepData.status || 'pending';
+  const stepData = data as unknown as StepNodeData;
+  const status = stepData?.status || 'pending';
   const color = statusColors[status];
 
   return (
