@@ -7,10 +7,18 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 from collections import defaultdict
 
-from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import (
+    FastAPI,
+    Depends,
+    HTTPException,
+    WebSocket,
+    WebSocketDisconnect,
+    Request,
+)
 from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
+from contextlib import asynccontextmanager
 import asyncio
 
 from ci_engine.server.db import get_db, init_db
@@ -33,7 +41,6 @@ from ci_engine.server.models import (
     AgentPoolResponse,
     AgentLabel,
     AgentLabelCreate,
-    AgentLabelResponse,
     JobLog,
     WebhookConfig,
     WebhookCreate,
@@ -51,11 +58,65 @@ from ci_engine.server.middleware import (
     create_refresh_token,
     verify_token,
     get_current_user,
+    limiter,
 )
 from ci_engine.server.webhooks import WebhookService
 
 
-app = FastAPI(title="CI Engine", version="0.1.0")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    from ci_engine.core.logging import setup_logging
+
+    setup_logging(
+        level=os.environ.get("LOG_LEVEL", "INFO"),
+        json_format=os.environ.get("LOG_FORMAT", "") == "json",
+    )
+    try:
+        from ci_engine.core.tracing import init_tracing
+
+        init_tracing("ci-engine-server")
+    except ImportError:
+        pass
+
+    yield
+
+    print("Starting graceful shutdown...")
+    active_builds = []
+    for channel in manager.active_connections.keys():
+        if channel.startswith("build:"):
+            build_id = channel.split(":")[1]
+            active_builds.append(build_id)
+
+    print(f"Broadcasting shutdown to {len(active_builds)} active builds...")
+
+    await manager.broadcast(
+        "builds:all",
+        {"type": "shutdown", "message": "Server is shutting down"},
+    )
+
+    for channel in list(manager.active_connections.keys()):
+        connections = list(manager.active_connections[channel])
+        for ws in connections:
+            try:
+                await ws.close(code=1012, reason="Server shutdown")
+            except Exception:
+                pass
+
+    print("WebSocket connections closed")
+
+    from ci_engine.server.db import engine
+
+    engine.dispose()
+
+    print("Database connections closed. Shutdown complete.")
+
+
+app = FastAPI(
+    title="CI Engine",
+    version="0.1.0",
+    lifespan=lifespan,
+)
 
 # CORS middleware first (outer)
 app.add_middleware(
@@ -80,6 +141,22 @@ app.add_middleware(
         "/api/auth/register",
     ],
 )
+
+# Rate limiting
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+
+limiter_obj = Limiter(key_func=get_remote_address)
+
+app.state.limiter = limiter_obj
+
+
+def get_limiter_key(request: Request) -> str:
+    """Get rate limit key - use auth header if available."""
+    auth = request.headers.get("Authorization")
+    if auth:
+        return auth
+    return get_remote_address(request)
 
 
 # WebSocket Connection Manager
@@ -235,29 +312,13 @@ def broadcast_build_status(
     )
 
 
-@app.on_event("startup")
-def startup():
-    init_db()
-    from ci_engine.core.logging import setup_logging
-
-    setup_logging(
-        level=os.environ.get("LOG_LEVEL", "INFO"),
-        json_format=os.environ.get("LOG_FORMAT", "") == "json",
-    )
-    try:
-        from ci_engine.core.tracing import init_tracing
-
-        init_tracing("ci-engine-server")
-    except ImportError:
-        pass
-
-
 app.include_router(dashboard_router)
 
 
 # Build endpoints
 @app.post("/api/builds", response_model=BuildResponse)
-def create_build(build_data: BuildCreate, db: Session = Depends(get_db)):
+@limiter.limit("100/minute")
+def create_build(request: Request, build_data: BuildCreate, db: Session = Depends(get_db)):
     """Create a new build from a pipeline definition."""
     import json
 
@@ -760,7 +821,6 @@ def get_agent_labels(agent_id: int, db: Session = Depends(get_db)):
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
 
-    from ci_engine.server.models import AgentLabel
 
     labels = db.query(AgentLabel).filter(AgentLabel.agent_id == agent_id).all()
     return [{"id": l.id, "key": l.key, "value": l.value} for l in labels]
@@ -773,7 +833,6 @@ def add_agent_label(agent_id: int, label: AgentLabelCreate, db: Session = Depend
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
 
-    from ci_engine.server.models import AgentLabel
 
     existing = (
         db.query(AgentLabel)
@@ -796,7 +855,6 @@ def add_agent_label(agent_id: int, label: AgentLabelCreate, db: Session = Depend
 @app.delete("/api/agents/{agent_id}/labels/{label_key}")
 def delete_agent_label(agent_id: int, label_key: str, db: Session = Depends(get_db)):
     """Delete a label from an agent."""
-    from ci_engine.server.models import AgentLabel
 
     label = (
         db.query(AgentLabel)
@@ -1153,46 +1211,13 @@ def prometheus_metrics():
     return Response(content=metrics_endpoint.get_metrics(), media_type="text/plain")
 
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Graceful shutdown handler - drain connections and finish jobs."""
-    print("Starting graceful shutdown...")
-
-    active_builds = []
-    for channel in manager.active_connections.keys():
-        if channel.startswith("build:"):
-            build_id = channel.split(":")[1]
-            active_builds.append(build_id)
-
-    print(f"Broadcasting shutdown to {len(active_builds)} active builds...")
-
-    await manager.broadcast(
-        "builds:all",
-        {"type": "shutdown", "message": "Server is shutting down"},
-    )
-
-    for channel in list(manager.active_connections.keys()):
-        connections = list(manager.active_connections[channel])
-        for ws in connections:
-            try:
-                await ws.close(code=1012, reason="Server shutdown")
-            except Exception:
-                pass
-        manager.active_connections[channel].clear()
-
-    print("WebSocket connections closed")
-
-    from ci_engine.server.db import engine
-
-    engine.dispose()
-
-    print("Database connections closed. Shutdown complete.")
+# WebSocket graceful shutdown is now handled in lifespan
 
 
 @app.get("/api/stats")
 def get_stats(db: Session = Depends(get_db)):
     """Get CI engine statistics."""
-    from datetime import datetime, timedelta
+    from datetime import datetime
 
     now = datetime.now(timezone.utc)
     day_ago = now - timedelta(days=1)
@@ -1726,7 +1751,7 @@ async def upload_artifact(
             storage_key = result.key
             storage_location = result.storage_location
             file_size = result.size
-        except Exception as e:
+        except Exception:
             pass
 
     artifact = Artifact(
@@ -1868,7 +1893,6 @@ def delete_artifact(artifact_id: int, db: Session = Depends(get_db)):
 @app.post("/api/admin/cleanup", tags=["admin"])
 def cleanup_old_builds(days: int = 30, db: Session = Depends(get_db)):
     """Clean up old builds and their data. Returns count of deleted items."""
-    from datetime import timedelta
 
     cutoff_date = datetime.now(timezone.utc) - timedelta(days=days)
 
@@ -1911,7 +1935,6 @@ def cleanup_old_builds(days: int = 30, db: Session = Depends(get_db)):
 @app.post("/api/admin/reap-offline-agents", tags=["admin"])
 def reap_offline_agents(timeout_minutes: int = 5, db: Session = Depends(get_db)):
     """Mark agents as offline if they haven't sent a heartbeat."""
-    from datetime import timedelta
 
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=timeout_minutes)
 
