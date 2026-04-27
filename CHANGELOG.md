@@ -15,6 +15,12 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - **Agent SDK** - Create custom agents with Python SDK
 - **Built-in Plugins** - Logging, metrics, caching, timeout, environment, validation
 
+#### Dashboard (Web UI)
+- **Pipeline Editor** - Visual drag-and-drop pipeline builder with React Flow
+- **Build List** - Table view of all builds with status
+- **Build Graph** - Visual job flow with status colors
+- **Agent Status** - Real-time agent dashboard with stats
+
 #### Security
 - **Secrets Injection** - Fernet-encrypted secrets with get_build_env_vars() for builds
 - **Command Sanitization** - CommandInjectionError prevents shell injection attacks
