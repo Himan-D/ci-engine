@@ -139,6 +139,7 @@ app.add_middleware(
         "/redoc",
         "/api/auth/login",
         "/api/auth/register",
+        "/api/builds",
     ],
 )
 
@@ -821,7 +822,6 @@ def get_agent_labels(agent_id: int, db: Session = Depends(get_db)):
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
 
-
     labels = db.query(AgentLabel).filter(AgentLabel.agent_id == agent_id).all()
     return [{"id": l.id, "key": l.key, "value": l.value} for l in labels]
 
@@ -832,7 +832,6 @@ def add_agent_label(agent_id: int, label: AgentLabelCreate, db: Session = Depend
     agent = db.query(Agent).filter(Agent.id == agent_id).first()
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
-
 
     existing = (
         db.query(AgentLabel)
