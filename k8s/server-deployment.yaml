@@ -87,11 +87,74 @@ spec:
         configMap:
           name: ci-engine-otel-config
 ---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: ci-engine-server
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: ci-engine-server
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ci-engine-server
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: ci-engine
+      component: server
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ci-engine-server
+  labels:
+    app: ci-engine
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+spec:
+  tls:
+  - hosts:
+    - ci-engine.example.com
+    secretName: ci-engine-tls
+  rules:
+  - host: ci-engine.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: ci-engine-server-lb
+            port:
+              number: 8000
+---
 apiVersion: v1
 kind: Service
 metadata:
   name: ci-engine-server
-  labels:
+labels:
     app: ci-engine
 spec:
   type: ClusterIP

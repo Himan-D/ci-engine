@@ -81,3 +81,14 @@ spec:
       target:
         type: Utilization
         averageUtilization: 70
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ci-engine-agent
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: ci-engine
+      component: agent

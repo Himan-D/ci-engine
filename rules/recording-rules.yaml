@@ -1,0 +1,30 @@
+groups:
+- name: ci-engine.recording_rules
+  interval: 30s
+  rules:
+  - record: job:ci_engine_jobs_completed_total:rate5m
+    expr: sum(rate(ci_engine_jobs_completed_total[5m])) by (org_id, pipeline_id)
+
+  - record: job:ci_engine_jobs_failed_total:rate5m
+    expr: sum(rate(ci_engine_jobs_failed_total[5m])) by (org_id, pipeline_id)
+
+  - record: job:ci_engine_job_success_rate:5m
+    expr: |
+      job:ci_engine_jobs_completed_total:rate5m{status="success"} 
+      / ignoring(status) group_left
+      job:ci_engine_jobs_completed_total:rate5m
+
+  - record: job:ci_engine_jobs_queue_time_p95:5m
+    expr: histogram_quantile(0.95, sum(rate(ci_engine_job_queue_duration_seconds_bucket[5m])) by (le, org_id))
+
+  - record: job:ci_engine_jobs_execution_time_p95:5m
+    expr: histogram_quantile(0.95, sum(rate(ci_engine_job_execution_duration_seconds_bucket[5m])) by (le, org_id))
+
+  - record: instance:ci_engine_cpu_usage:rate5m
+    expr: sum(rate(ci_engine_process_cpu_seconds_total[5m])) by (instance, job)
+
+  - record: instance:ci_engine_memory_usage_bytes
+    expr: ci_engine_process_resident_memory_bytes
+
+  - record: instance:ci_engine_request_duration_p95:5m
+    expr: histogram_quantile(0.95, sum(rate(ci_engine_http_request_duration_seconds_bucket[5m])) by (le, method, path))

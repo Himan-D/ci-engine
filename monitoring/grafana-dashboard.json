@@ -1,0 +1,141 @@
+{
+  "dashboard": {
+    "title": "CI Engine - Overview",
+    "tags": ["ci-engine", "production"],
+    "timezone": "browser",
+    "refresh": "30s",
+    "panels": [
+      {
+        "id": 1,
+        "gridPos": {"x": 0, "y": 0, "w": 6, "h": 4},
+        "type": "stat",
+        "title": "Jobs Completed (Last Hour)",
+        "targets": [
+          {
+            "expr": "sum(increase(ci_engine_jobs_completed_total[1h]))",
+            "legendFormat": "Completed"
+          }
+        ]
+      },
+      {
+        "id": 2,
+        "gridPos": {"x": 6, "y": 0, "w": 6, "h": 4},
+        "type": "stat",
+        "title": "Jobs Failed (Last Hour)",
+        "targets": [
+          {
+            "expr": "sum(increase(ci_engine_jobs_failed_total[1h]))",
+            "legendFormat": "Failed"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"color": "green", "value": null},
+                {"color": "red", "value": 10}
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 3,
+        "gridPos": {"x": 12, "y": 0, "w": 6, "h": 4},
+        "type": "stat",
+        "title": "Success Rate",
+        "targets": [
+          {
+            "expr": "sum(increase(ci_engine_jobs_completed_total{status='success'}[1h])) / sum(increase(ci_engine_jobs_completed_total[1h])) * 100",
+            "legendFormat": "Success %"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"color": "red", "value": null},
+                {"color": "yellow", "value": 80},
+                {"color": "green", "value": 95}
+              ]
+            },
+            "unit": "percent"
+          }
+        }
+      },
+      {
+        "id": 4,
+        "gridPos": {"x": 18, "y": 0, "w": 6, "h": 4},
+        "type": "stat",
+        "title": "Active Agents",
+        "targets": [
+          {
+            "expr": "sum(ci_engine_agents_total{status='online'})",
+            "legendFormat": "Online"
+          }
+        ]
+      },
+      {
+        "id": 5,
+        "gridPos": {"x": 0, "y": 4, "w": 12, "h": 8},
+        "type": "graph",
+        "title": "Job Queue Time (P95)",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, sum(rate(ci_engine_job_queue_duration_seconds_bucket[5m])) by (le))",
+            "legendFormat": "P95 Queue Time"
+          }
+        ],
+        "yaxes": [{"unit": "s"}, {"unit": "short"}]
+      },
+      {
+        "id": 6,
+        "gridPos": {"x": 12, "y": 4, "w": 12, "h": 8},
+        "type": "graph",
+        "title": "Job Execution Time (P95)",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, sum(rate(ci_engine_job_execution_duration_seconds_bucket[5m])) by (le))",
+            "legendFormat": "P95 Execution Time"
+          }
+        ],
+        "yaxes": [{"unit": "s"}, {"unit": "short"}]
+      },
+      {
+        "id": 7,
+        "gridPos": {"x": 0, "y": 12, "w": 12, "h": 8},
+        "type": "graph",
+        "title": "Server CPU Usage",
+        "targets": [
+          {
+            "expr": "sum(rate(container_cpu_usage_seconds_total{pod=~'ci-engine-server.*'}[5m])) by (pod) * 100",
+            "legendFormat": "{{pod}}"
+          }
+        ],
+        "yaxes": [{"unit": "percentunit", "min": 0, "max": 100}, {"unit": "short"}]
+      },
+      {
+        "id": 8,
+        "gridPos": {"x": 12, "y": 12, "w": 12, "h": 8},
+        "type": "graph",
+        "title": "Server Memory Usage",
+        "targets": [
+          {
+            "expr": "sum(container_memory_working_set_bytes{pod=~'ci-engine-server.*'}) by (pod) / 1024 / 1024 / 1024",
+            "legendFormat": "{{pod}}"
+          }
+        ],
+        "yaxes": [{"unit": "bytes"}, {"unit": "short"}]
+      }
+    ]
+  },
+  "datasources": {
+    " Prometheus": {
+      "type": "prometheus",
+      "url": "http://prometheus.monitoring:9090",
+      "access": "proxy"
+    }
+  }
+}

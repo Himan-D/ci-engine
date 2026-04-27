@@ -1,0 +1,97 @@
+groups:
+- name: ci-engine.rules
+  interval: 30s
+  rules:
+  - alert: CIEngineHighErrorRate
+    expr: |
+      sum(rate(ci_engine_jobs_total{status="failed"}[5m])) 
+      / sum(rate(ci_engine_jobs_total[5m])) > 0.1
+    for: 5m
+    labels:
+      severity: critical
+    annotations:
+      summary: "CI Engine high error rate"
+      description: "More than 10% of CI jobs are failing"
+
+  - alert: CIEngineHighJobQueueTime
+    expr: |
+      histogram_quantile(0.95, sum(rate(ci_engine_job_queue_duration_seconds_bucket[5m])) by (le)) > 300
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "CI Engine high job queue time"
+      description: "Job queue time is above 5 minutes (P95)"
+
+  - alert: CIEngineAgentOffline
+    expr: |
+      sum(ci_engine_agents_total{status="online"}) 
+      / sum(ci_engine_agents_total) < 0.5
+    for: 5m
+    labels:
+      severity: critical
+    annotations:
+      summary: "CI Engine agents offline"
+      description: "Less than 50% of agents are online"
+
+  - alert: CIEngineServerHighCPU
+    expr: |
+      sum(rate(container_cpu_usage_seconds_total{pod=~"ci-engine-server.*"}[5m])) 
+      / sum(container_spec_cpu_quota{pod=~"ci-engine-server.*"}/container_spec_cpu_period) > 0.85
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "CI Engine server high CPU usage"
+      description: "Server CPU usage is above 85%"
+
+  - alert: CIEngineServerHighMemory
+    expr: |
+      sum(container_memory_working_set_bytes{pod=~"ci-engine-server.*"}) 
+      / sum(container_spec_memory_limit_bytes{pod=~"ci-engine-server.*"}) > 0.85
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "CI Engine server high memory usage"
+      description: "Server memory usage is above 85% of limit"
+
+  - alert: CIEngineDatabaseConnectionError
+    expr: |
+      increase(database_connections_errors_total[5m]) > 10
+    for: 2m
+    labels:
+      severity: critical
+    annotations:
+      summary: "CI Engine database connection errors"
+      description: "Multiple database connection errors detected"
+
+  - alert: CIEngineArtifactUploadFailed
+    expr: |
+      sum(rate(ci_engine_artifacts_upload_failed_total[5m])) > 0
+    for: 2m
+    labels:
+      severity: warning
+    annotations:
+      summary: "CI Engine artifact upload failures"
+      description: "Artifact uploads are failing"
+
+  - alert: CIEngineDiskSpaceLow
+    expr: |
+      (node_filesystem_avail_bytes / node_filesystem_size_bytes) < 0.15
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "CI Engine disk space low"
+      description: "Disk space is below 15%"
+
+  - alert: CIEnginePodCrashLooping
+    expr: |
+      increase(kube_pod_container_status_restarts_total[5m]) > 3
+    for: 2m
+    labels:
+      severity: critical
+    annotations:
+      summary: "CI Engine pod crash looping"
+      description: "Pod is crash looping"

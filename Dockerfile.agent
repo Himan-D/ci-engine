@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# CI Engine - Multi-stage Dockerfile (Production Hardened)
+# CI Engine - Agent Dockerfile (Production Hardened)
 
 FROM python:3.12-slim AS builder
 
@@ -8,6 +8,7 @@ WORKDIR /build
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     libpq-dev \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml ./
@@ -17,20 +18,26 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Security: Create non-root user with specific UID
+# Security: Create non-root user
 RUN groupadd -g 1000 ci-engine && \
     useradd -r -u 1000 -g ci-engine ci-engine && \
     apt-get update && apt-get install -y --no-install-recommends \
     libpq5 \
     curl \
+    git \
+    docker.io \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy dependencies
 COPY --from=builder /install /usr/local
 
-# Create required directories with proper ownership
+# Create required directories
 RUN mkdir -p /workspace /tmp/ci-engine-workspace /var/log/ci-engine && \
     chown -R ci-engine:ci-engine /workspace /tmp /var/log
+
+# Add docker group for docker socket access
+RUN groupadd -g 999 docker || true && \
+    usermod -aG docker ci-engine
 
 # Security: Switch to non-root user
 USER ci-engine
@@ -38,14 +45,14 @@ USER ci-engine
 # Environment variables
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    DATABASE_URL=postgresql://ci_engine:ci_engine@postgres/ci_engine
+    CI_WORKSPACE=/workspace
 
-# Expose ports
-EXPOSE 8000 9090
+# Expose agent port
+EXPOSE 8070
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
+    CMD curl -f http://localhost:8070/health || exit 1
 
 # Run as non-root user
-CMD ["uvicorn", "ci_engine.server.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python", "-m", "ci_engine.agent.agent"]

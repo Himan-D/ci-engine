@@ -1,0 +1,119 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: ci-engine-backup
+  labels:
+    app: ci-engine
+    component: backup
+spec:
+  schedule: "0 2 * * *"
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app: ci-engine
+            component: backup
+        spec:
+          serviceAccountName: ci-engine-backup
+          restartPolicy: OnFailure
+          containers:
+          - name: backup
+            image: ci-engine/backup:latest
+            command:
+            - /scripts/backup.sh
+            env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: ci-engine-secrets
+                  key: database-url
+            - name: ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ci-engine-secrets
+                  key: encryption-key
+            - name: S3_BACKUP_BUCKET
+              valueFrom:
+                configMapKeyRef:
+                  name: ci-engine-config
+                  key: s3-backup-bucket
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: ci-engine-backup-credentials
+                  key: access-key
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ci-engine-backup-credentials
+                  key: secret-key
+            resources:
+              requests:
+                cpu: 100m
+                memory: 128Mi
+              limits:
+                cpu: 500m
+                memory: 512Mi
+            volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+            - name: backup-storage
+              mountPath: /backups
+          volumes:
+          - name: scripts
+            configMap:
+              name: ci-engine-backup-scripts
+          - name: backup-storage
+            persistentVolumeClaim:
+              claimName: ci-engine-backup-pvc
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ci-engine-backup-pvc
+  labels:
+    app: ci-engine
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ci-engine-backup
+  labels:
+    app: ci-engine
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ci-engine-backup
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs:
+  - get
+  - list
+  - create
+  - update
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ci-engine-backup
+subjects:
+- kind: ServiceAccount
+  name: ci-engine-backup
+roleRef:
+  kind: Role
+  name: ci-engine-backup
