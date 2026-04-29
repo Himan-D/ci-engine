@@ -122,7 +122,10 @@ def parse_pipeline(pipeline: str) -> list[dict[str, Any]]:
 
     if isinstance(data, list):
         steps = _expand_matrix_steps(data)
-        return _evaluate_conditionals(steps, data.get("env", {}))
+        env = {}
+        if data and isinstance(data[0], dict):
+            env = data[0].get("env", {})
+        return _evaluate_conditionals(steps, env)
 
     if isinstance(data, dict):
         steps = data.get("steps", [])

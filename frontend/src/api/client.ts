@@ -1,4 +1,17 @@
-const API_BASE = 'http://localhost:8002';
+// API base URL - can be overridden via environment
+const API_BASE = (typeof window !== 'undefined' 
+  ? (localStorage.getItem('CI_ENGINE_API') || 'http://localhost:8000')
+  : 'http://localhost:8000');
+
+// Alternative: import.meta.env can be used in Vite
+// For now, we use localStorage for browser compatibility
+export function setApiBase(url: string) {
+  localStorage.setItem('CI_ENGINE_API', url);
+}
+
+export function getApiBase(): string {
+  return localStorage.getItem('CI_ENGINE_API') || 'http://localhost:8000';
+}
 
 export interface Build {
   id: number;

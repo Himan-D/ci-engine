@@ -314,15 +314,6 @@ class OIDCTokenVerifier:
             return is_valid
         except Exception:
             return False
-            iss = unverified.get("iss")
-            aud = unverified.get("aud")
-            if iss != OIDCProviderManager.GCP_ISSUER:
-                return False
-            if aud != audience:
-                return False
-            return True
-        except Exception:
-            return False
 
     @staticmethod
     def verify_azure_token(token: str, audience: str) -> bool:

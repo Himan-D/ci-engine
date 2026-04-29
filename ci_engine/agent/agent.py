@@ -253,6 +253,39 @@ class Agent:
         stderr = ""
 
         try:
+            # Clone repository if build has repository info
+            build_info = job.get("build", {})
+            repository = build_info.get("repository") if build_info else None
+            workspace_dir = os_module.environ.get("CI_WORKSPACE", "/tmp/ci-engine-workspace")
+
+            if repository:
+                from ci_engine.agent.git import clone_repository, GitCloneError
+
+                print(f"Cloning repository: {repository}")
+                branch = build_info.get("branch", "main")
+                commit = build_info.get("commit")
+                ref = commit or branch or "main"
+                depth = build_info.get("clone_depth")
+
+                try:
+                    clone_repository(
+                        repo_url=repository,
+                        target_dir=workspace_dir,
+                        ref=ref,
+                        depth=depth,
+                    )
+                    print(f"Repository cloned: {ref}")
+                except GitCloneError as e:
+                    error_msg = f"Failed to clone repository: {e}"
+                    print(error_msg)
+                    self.send_log_ws(job_id, "stderr", error_msg)
+                    return 1
+                except FileNotFoundError:
+                    error_msg = "Git not installed on agent"
+                    print(error_msg)
+                    self.send_log_ws(job_id, "stderr", error_msg)
+                    return 1
+
             if container_image:
                 print(f"Running in container: {container_image}")
                 from ci_engine.core.container import execute_in_container
