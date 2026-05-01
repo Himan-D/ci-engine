@@ -505,7 +505,6 @@ class BuildCacheManager:
             if data:
                 import tempfile
                 import tarfile
-                import io
 
                 with tempfile.NamedTemporaryFile(delete=False) as tmp:
                     tmp.write(data)
@@ -549,7 +548,6 @@ class BuildCacheManager:
         try:
             import tempfile
             import tarfile
-            import io
 
             with tempfile.NamedTemporaryFile(delete=False, suffix=".tar.gz") as tmp:
                 with tarfile.open(tmp.name, "w:gz") as tar:

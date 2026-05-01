@@ -270,7 +270,6 @@ class OIDCTokenVerifier:
     def verify_github_token(token: str, audience: str) -> bool:
         """Verify GitHub Actions OIDC token with signature verification."""
         try:
-            import jwt
 
             # Use proper signature verification
             is_valid, payload = OIDCProviderManager.verify_token_with_signature(

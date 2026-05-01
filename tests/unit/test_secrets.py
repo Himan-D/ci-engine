@@ -4,13 +4,11 @@
 import pytest
 from unittest.mock import MagicMock, patch
 from ci_engine.core.secrets import (
-    Secret,
     SecretCreate,
     SecretResponse,
     SecretService,
     _encrypt_value,
     _decrypt_value,
-    _get_fernet,
 )
 
 
@@ -106,7 +104,6 @@ class TestSecretModels:
     def test_secret_response_model(self):
         """Test SecretResponse model."""
         from datetime import datetime, timezone
-        from pydantic import ConfigDict
 
         secret = SecretResponse(
             id=1,

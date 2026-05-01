@@ -3,7 +3,6 @@
 
 import os
 import smtplib
-import asyncio
 import logging
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -12,6 +11,7 @@ from enum import Enum
 
 import requests
 from pydantic import BaseModel
+from datetime import datetime, timezone
 
 
 logger = logging.getLogger(__name__)
@@ -157,6 +157,18 @@ class NotificationService:
             fields.append({"title": "Job", "value": job.get("label", "N/A")})
             fields.append({"title": "Exit Code", "value": str(job.get("exit_code", "N/A"))})
 
+        # Append AI analysis fields if present
+        ai = data.get("ai_analysis")
+        if ai:
+            if ai.get("root_cause"):
+                fields.append({"title": "AI Root Cause", "value": ai["root_cause"]})
+            if ai.get("fixed_command") and ai.get("fix_applied"):
+                fields.append({"title": "Auto-fix Applied", "value": f"`{ai['fixed_command']}`"})
+            elif ai.get("fixed_command"):
+                fields.append({"title": "AI Suggested Fix", "value": f"`{ai['fixed_command']}`"})
+            if ai.get("pipeline_suggestion"):
+                fields.append({"title": "AI Suggestion", "value": ai["pipeline_suggestion"]})
+
         payload = {
             "channel": config.channel,
             "username": config.username or "CI Engine",
@@ -196,6 +208,18 @@ class NotificationService:
         if "job" in data:
             job = data["job"]
             fields.append({"name": "Job", "value": job.get("label", "N/A")})
+
+        # Append AI analysis fields if present
+        ai = data.get("ai_analysis")
+        if ai:
+            if ai.get("root_cause"):
+                fields.append({"name": "AI Root Cause", "value": ai["root_cause"], "inline": False})
+            if ai.get("fixed_command") and ai.get("fix_applied"):
+                fields.append({"name": "Auto-fix Applied", "value": f"`{ai['fixed_command']}`", "inline": False})
+            elif ai.get("fixed_command"):
+                fields.append({"name": "AI Suggested Fix", "value": f"`{ai['fixed_command']}`", "inline": False})
+            if ai.get("pipeline_suggestion"):
+                fields.append({"name": "AI Suggestion", "value": ai["pipeline_suggestion"], "inline": False})
 
         embed = {
             "description": description,

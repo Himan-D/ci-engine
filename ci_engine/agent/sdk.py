@@ -31,7 +31,6 @@ agent.run()
 For more complex use cases, see examples/agent-plugins/
 """
 
-from typing import Optional, Any
 
 from ci_engine.agent.plugins import (
     AgentPlugin as CIEnginePlugin,

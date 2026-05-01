@@ -126,7 +126,7 @@ DASHBOARD_HTML = """
 @router.get("/", response_class=HTMLResponse)
 def dashboard(db: Session = Depends(get_db)):
     """Render the main dashboard."""
-    from datetime import datetime, timedelta
+    from datetime import datetime, timedelta, timezone
 
     now = datetime.now(timezone.utc)
     day_ago = now - timedelta(days=1)

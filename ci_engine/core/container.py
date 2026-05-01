@@ -2,10 +2,9 @@
 # CI Engine - Container Isolation (Docker Executor)
 
 import os
-import json
 import subprocess
 import uuid
-from typing import Optional, Dict, Any
+from typing import Optional, Dict
 from dataclasses import dataclass
 from enum import Enum
 
@@ -23,6 +22,41 @@ class ContainerRuntime(str, Enum):
 
 
 @dataclass
+class ContainerSecurityPolicy:
+    """Security constraints applied to a job container.
+
+    Defaults match a hardened CI profile: no privilege escalation, all
+    capabilities dropped, read-only root filesystem, limited PIDs.
+    Pipelines may relax specific settings via the ``security:`` DSL block.
+    """
+    allow_privilege_escalation: bool = False
+    drop_all_capabilities: bool = True
+    read_only_rootfs: bool = True
+    # "builtin" → use bundled seccomp.json; None → no seccomp; path → custom
+    seccomp_profile: Optional[str] = "builtin"
+    pids_limit: int = 256
+    # "none" = no network (default); "bridge" = standard Docker bridge
+    network_mode: str = "bridge"
+    # Extra tmpfs mounts beyond the default /tmp (e.g. /home/user/.cache)
+    extra_tmpfs: Optional[list] = None
+
+    @classmethod
+    def from_pipeline(cls, security_dict: Optional[dict]) -> "ContainerSecurityPolicy":
+        """Parse a pipeline ``security:`` block into a policy object."""
+        if not security_dict:
+            return cls()
+        return cls(
+            allow_privilege_escalation=security_dict.get("allow_privilege_escalation", False),
+            drop_all_capabilities=security_dict.get("drop_all_capabilities", True),
+            read_only_rootfs=security_dict.get("read_only_rootfs", True),
+            seccomp_profile=security_dict.get("seccomp", "builtin"),
+            pids_limit=int(security_dict.get("pids_limit", 256)),
+            network_mode=security_dict.get("network", "bridge"),
+            extra_tmpfs=security_dict.get("extra_tmpfs"),
+        )
+
+
+@dataclass
 class ContainerConfig:
     """Configuration for a containerized job execution."""
 
@@ -36,6 +70,8 @@ class ContainerConfig:
     user: Optional[str] = None
     volumes: Optional[list] = None
     timeout_seconds: int = 3600
+    security: Optional[ContainerSecurityPolicy] = None
+    build_id: int = 0   # for container label
 
 
 @dataclass
@@ -113,22 +149,75 @@ class DockerExecutor:
     def _build_run_command(
         self, config: ContainerConfig, container_name: str, workspace_dir: str
     ) -> list:
-        """Build the docker run command."""
-        cmd = [self.runtime.value, "run", "--name", container_name, "--rm", "-w", config.workdir]
-        if config.network_mode:
-            cmd.extend(["--network", config.network_mode])
+        """Build the docker run command with security hardening."""
+        sec: ContainerSecurityPolicy = config.security or ContainerSecurityPolicy()
+
+        cmd = [
+            self.runtime.value, "run",
+            "--name", container_name,
+            "--rm",
+            "-w", config.workdir,
+            # Label for orphan cleanup
+            "--label", f"ci-engine-build-id={getattr(config, 'build_id', 0)}",
+        ]
+
+        # Network
+        network = sec.network_mode or config.network_mode or "bridge"
+        cmd.extend(["--network", network])
+
+        # Resource limits
         if config.cpu_limit:
             cmd.extend(["--cpus", config.cpu_limit])
         if config.memory_limit:
             cmd.extend(["--memory", config.memory_limit])
+
+        # PID limit
+        cmd.extend(["--pids-limit", str(sec.pids_limit)])
+
+        # Security options
+        if not sec.allow_privilege_escalation:
+            cmd.extend(["--security-opt", "no-new-privileges:true"])
+
+        if sec.drop_all_capabilities:
+            cmd.extend(["--cap-drop", "ALL"])
+            # Network operations need NET_BIND_SERVICE when network is enabled
+            if network not in ("none", ""):
+                cmd.extend(["--cap-add", "NET_BIND_SERVICE"])
+
+        # Seccomp profile
+        if sec.seccomp_profile == "builtin":
+            profile_path = os.path.join(os.path.dirname(__file__), "seccomp.json")
+            if os.path.exists(profile_path):
+                cmd.extend(["--security-opt", f"seccomp={profile_path}"])
+        elif sec.seccomp_profile and sec.seccomp_profile != "unconfined":
+            if os.path.exists(sec.seccomp_profile):
+                cmd.extend(["--security-opt", f"seccomp={sec.seccomp_profile}"])
+        elif sec.seccomp_profile == "unconfined":
+            cmd.extend(["--security-opt", "seccomp=unconfined"])
+
+        # Read-only root filesystem + writable /tmp tmpfs
+        if sec.read_only_rootfs:
+            cmd.append("--read-only")
+            cmd.extend(["--tmpfs", "/tmp:size=512m,mode=1777"])
+            # Node.js npm cache often lands in ~/.npm
+            cmd.extend(["--tmpfs", "/root/.npm:size=256m,mode=0700"])
+
+        # Extra tmpfs mounts requested by the pipeline
+        for extra in (sec.extra_tmpfs or []):
+            cmd.extend(["--tmpfs", extra])
+
+        # Volumes
         if config.volumes:
             for vol in [f"{workspace_dir}:{config.workdir}"] + config.volumes:
                 cmd.extend(["-v", vol])
         else:
             cmd.extend(["-v", f"{workspace_dir}:{config.workdir}"])
+
+        # Environment variables
         if config.env_vars:
             for key, value in config.env_vars.items():
                 cmd.extend(["-e", f"{key}={value}"])
+
         cmd.append(config.image)
         cmd.extend(["/bin/sh", "-c", config.command])
         return cmd
@@ -176,7 +265,7 @@ class DockerExecutor:
         except subprocess.TimeoutExpired:
             logger.warning(f"Timeout cleaning up container {container_name}")
         except FileNotFoundError:
-            logger.debug(f"Runtime not available for cleanup")
+            logger.debug("Runtime not available for cleanup")
         except Exception as e:
             logger.warning(f"Failed to clean up container {container_name}: {e}")
 

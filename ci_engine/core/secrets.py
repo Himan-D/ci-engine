@@ -16,7 +16,9 @@ class Secret(Base):
     __tablename__ = "secrets"
 
     id = Column(Integer, primary_key=True)
-    name = Column(String(100), unique=True, nullable=False)
+    name = Column(String(100), nullable=False)
+    # repository=None → global secret; repository='owner/repo' → repo-scoped
+    repository = Column(String(500), nullable=True, index=True)
     value_encrypted = Column(Text, nullable=False)
     key_version = Column(Integer, default=1)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
@@ -72,6 +74,7 @@ class SecretCreate(BaseModel):
     name: str
     value: str
     created_by: Optional[str] = None
+    repository: Optional[str] = None  # None = global; 'owner/repo' = repo-scoped
 
 
 class SecretResponse(BaseModel):
@@ -90,11 +93,25 @@ class SecretService:
     """Service for managing secrets."""
 
     @staticmethod
-    def create_secret(db, name: str, value: str, created_by: Optional[str] = None) -> Secret:
-        """Create a new secret with Fernet encryption."""
+    def create_secret(
+        db,
+        name: str,
+        value: str,
+        created_by: Optional[str] = None,
+        repository: Optional[str] = None,
+    ) -> Secret:
+        """Create a new secret with Fernet encryption.
+
+        If *repository* is given (e.g. ``'owner/repo'``) the secret is
+        repo-scoped and will only be injected into builds from that repo.
+        Repository-scoped secrets override global ones with the same name.
+        """
+        if not value:
+            raise ValueError("Secret value must not be empty")
         encrypted, key_version = _encrypt_value(value)
         secret = Secret(
             name=name,
+            repository=_normalise_repo(repository),
             value_encrypted=encrypted,
             key_version=key_version,
             created_by=created_by,
@@ -182,7 +199,7 @@ class SecretService:
         secrets = (
             db.query(Secret)
             .filter(
-                Secret.is_active == True,
+                Secret.is_active,
             )
             .all()
         )
@@ -201,3 +218,64 @@ class SecretService:
                 continue
 
         return env_vars
+
+
+def _normalise_repo(repo: Optional[str]) -> Optional[str]:
+    """Normalise repository identifier to 'owner/repo' (strip https://, trailing slash, .git)."""
+    if not repo:
+        return None
+    r = repo.strip().rstrip("/")
+    if r.endswith(".git"):
+        r = r[:-4]
+    # Strip https://github.com/ or git@github.com: prefix
+    for prefix in ("https://github.com/", "https://gitlab.com/", "git@github.com:", "git@gitlab.com:"):
+        if r.startswith(prefix):
+            r = r[len(prefix):]
+            break
+    return r or None
+
+
+def get_active_secrets(db, repository: Optional[str] = None) -> dict[str, str]:
+    """Return decrypted key=value dict of active secrets for a build.
+
+    Two-pass strategy:
+      1. Fetch all global secrets (repository IS NULL).
+      2. Fetch repo-scoped secrets for *repository* (overrides globals).
+
+    If ``CI_ENGINE_FERNET_KEY`` is not set (dev mode), returns {} gracefully.
+    """
+    try:
+        _get_fernet()
+    except ValueError:
+        return {}
+
+    normalised = _normalise_repo(repository)
+
+    # Pass 1 — global secrets
+    global_secrets = (
+        db.query(Secret)
+        .filter(Secret.is_active, Secret.repository.is_(None))
+        .all()
+    )
+
+    result: dict[str, str] = {}
+    for s in global_secrets:
+        try:
+            result[s.name] = _decrypt_value(s.value_encrypted, s.key_version)
+        except Exception:
+            pass
+
+    # Pass 2 — repo-scoped secrets (override globals of same name)
+    if normalised:
+        repo_secrets = (
+            db.query(Secret)
+            .filter(Secret.is_active, Secret.repository == normalised)
+            .all()
+        )
+        for s in repo_secrets:
+            try:
+                result[s.name] = _decrypt_value(s.value_encrypted, s.key_version)
+            except Exception:
+                pass
+
+    return result

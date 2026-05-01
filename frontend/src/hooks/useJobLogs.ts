@@ -1,149 +1,176 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react'
 
 export interface LogLine {
-  line: string;
-  stream: 'stdout' | 'stderr';
-  timestamp: number;
+  line: string
+  stream: 'stdout' | 'stderr' | 'system'
+  timestamp: number
+  lineNumber?: number
 }
 
-export function useJobLogs(jobId: number | null, serverBase: string) {
-  const [logs, setLogs] = useState<LogLine[]>([]);
-  const [connected, setConnected] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const wsRef = useRef<WebSocket | null>(null);
-  const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+export interface JobLogsState {
+  logs: LogLine[]
+  connected: boolean
+  error: string | null
+  clearLogs: () => void
+  disconnect: () => void
+}
 
-  const connect = useCallback(() => {
-    if (!jobId) return;
-    
-    const wsUrl = serverBase.replace('http', 'ws') + `/ws/jobs/${jobId}/logs`;
-    
-    try {
-      const ws = new WebSocket(wsUrl);
-      wsRef.current = ws;
+function getWsBase(): string {
+  const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+  return `${proto}//${window.location.host}`
+}
 
-      ws.onopen = () => {
-        setConnected(true);
-        setError(null);
-      };
+export function useJobLogs(jobId: number | null): JobLogsState {
+  const [logs, setLogs] = useState<LogLine[]>([])
+  const [connected, setConnected] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const wsRef = useRef<WebSocket | null>(null)
+  const reconnectRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const mountedRef = useRef(true)
+  const attemptRef = useRef(0)
 
-      ws.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data);
-          setLogs(prev => [...prev, {
-            line: data.line || data.message || '',
-            stream: data.stream || 'stdout',
-            timestamp: Date.now(),
-          }]);
-        } catch {
-          setLogs(prev => [...prev, {
-            line: event.data,
-            stream: 'stdout',
-            timestamp: Date.now(),
-          }]);
-        }
-      };
+  useEffect(() => {
+    mountedRef.current = true
+    return () => { mountedRef.current = false }
+  }, [])
 
-      ws.onerror = () => {
-        setError('WebSocket connection error');
-        setConnected(false);
-      };
-
-      ws.onclose = () => {
-        setConnected(false);
-        // Auto-reconnect after 3 seconds if jobId still exists
-        if (jobId) {
-          reconnectTimeoutRef.current = setTimeout(() => {
-            connect();
-          }, 3000);
-        }
-      };
-    } catch (e) {
-      setError('Failed to connect to log stream');
-    }
-  }, [jobId, serverBase]);
+  const clearLogs = useCallback(() => setLogs([]), [])
 
   const disconnect = useCallback(() => {
-    if (reconnectTimeoutRef.current) {
-      clearTimeout(reconnectTimeoutRef.current);
-      reconnectTimeoutRef.current = null;
-    }
+    if (reconnectRef.current) clearTimeout(reconnectRef.current)
     if (wsRef.current) {
-      wsRef.current.close();
-      wsRef.current = null;
+      wsRef.current.onclose = null
+      wsRef.current.close()
+      wsRef.current = null
     }
-    setConnected(false);
-  }, []);
-
-  const clearLogs = useCallback(() => {
-    setLogs([]);
-  }, []);
+    setConnected(false)
+  }, [])
 
   useEffect(() => {
-    if (jobId) {
-      connect();
-    } else {
-      disconnect();
+    if (!jobId) {
+      setLogs([])
+      setConnected(false)
+      return
     }
-    return () => disconnect();
-  }, [jobId, connect, disconnect]);
 
-  return { logs, connected, error, clearLogs, disconnect };
-}
+    attemptRef.current = 0
 
-export function useBuildUpdates(buildId: number | null, serverBase: string) {
-  const [buildStatus, setBuildStatus] = useState<string | null>(null);
-  const [jobStatuses, setJobStatuses] = useState<Record<number, string>>({});
-  const wsRef = useRef<WebSocket | null>(null);
+    const connect = () => {
+      if (!mountedRef.current) return
+      const url = `${getWsBase()}/ws/jobs/${jobId}/logs`
+      let ws: WebSocket
+      try {
+        ws = new WebSocket(url)
+      } catch (e) {
+        setError('Cannot connect to log stream')
+        return
+      }
+      wsRef.current = ws
 
-  const connect = useCallback(() => {
-    if (!buildId) return;
-    
-    const wsUrl = serverBase.replace('http', 'ws') + `/ws/builds/${buildId}/updates`;
-    
-    try {
-      const ws = new WebSocket(wsUrl);
-      wsRef.current = ws;
+      ws.onopen = () => {
+        if (!mountedRef.current) { ws.close(); return }
+        attemptRef.current = 0
+        setConnected(true)
+        setError(null)
+      }
 
-      ws.onmessage = (event) => {
+      ws.onmessage = (e) => {
+        if (!mountedRef.current) return
         try {
-          const data = JSON.parse(event.data);
-          if (data.build_status) {
-            setBuildStatus(data.build_status);
+          const msg = JSON.parse(e.data as string) as Record<string, unknown>
+          if (msg.type === 'pong') return
+          const logLine: LogLine = {
+            line: String(msg.content ?? msg.line ?? msg.message ?? e.data),
+            stream: (msg.stream as LogLine['stream']) ?? 'stdout',
+            timestamp: Date.now(),
+            lineNumber: msg.line_number as number | undefined,
           }
-          if (data.job_statuses) {
-            setJobStatuses(data.job_statuses);
-          }
+          setLogs(prev => [...prev, logLine])
         } catch {
-          // Ignore parse errors
+          setLogs(prev => [...prev, { line: e.data as string, stream: 'stdout', timestamp: Date.now() }])
         }
-      };
+      }
 
       ws.onerror = () => {
-        // Silently ignore errors for build updates
-      };
+        if (!mountedRef.current) return
+        setError('Connection error')
+        setConnected(false)
+      }
 
       ws.onclose = () => {
-        // Silently reconnect
-        if (buildId) {
-          setTimeout(() => connect(), 3000);
+        if (!mountedRef.current) return
+        setConnected(false)
+        const delay = Math.min(1000 * 2 ** attemptRef.current, 8000)
+        attemptRef.current++
+        reconnectRef.current = setTimeout(connect, delay)
+      }
+
+      // Ping every 25s to keep the connection alive through proxies
+      const pingId = setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'ping' }))
         }
-      };
-    } catch {
-      // Ignore connection errors
+      }, 25_000)
+
+      // Attach to ws so we can clear it on cleanup
+      ;(ws as WebSocket & { _ping: ReturnType<typeof setInterval> })._ping = pingId
     }
-  }, [buildId, serverBase]);
+
+    connect()
+
+    return () => {
+      if (reconnectRef.current) clearTimeout(reconnectRef.current)
+      const ws = wsRef.current as (WebSocket & { _ping?: ReturnType<typeof setInterval> }) | null
+      if (ws) {
+        clearInterval(ws._ping)
+        ws.onclose = null
+        ws.close()
+      }
+      wsRef.current = null
+    }
+  }, [jobId])
+
+  return { logs, connected, error, clearLogs, disconnect }
+}
+
+// ─── Build-level status stream ───────────────────────────────────────────────
+
+export interface BuildUpdate {
+  type: string
+  build_id?: number
+  job_id?: number
+  status?: string
+  exit_code?: number
+}
+
+export function useBuildUpdates(buildId: number | null) {
+  const [lastUpdate, setLastUpdate] = useState<BuildUpdate | null>(null)
+  const wsRef = useRef<WebSocket | null>(null)
 
   useEffect(() => {
-    if (buildId) {
-      connect();
-    }
-    return () => {
-      if (wsRef.current) {
-        wsRef.current.close();
-      }
-    };
-  }, [buildId, connect]);
+    if (!buildId) return
+    const url = `${getWsBase()}/ws/builds/${buildId}`
+    let ws: WebSocket
+    try { ws = new WebSocket(url) } catch { return }
+    wsRef.current = ws
 
-  return { buildStatus, jobStatuses };
+    ws.onmessage = (e) => {
+      try {
+        const msg = JSON.parse(e.data as string) as BuildUpdate
+        if (msg.type && msg.type !== 'pong') setLastUpdate(msg)
+      } catch { /* ignore */ }
+    }
+
+    const pingId = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'ping' }))
+    }, 25_000)
+
+    return () => {
+      clearInterval(pingId)
+      ws.onclose = null
+      ws.close()
+    }
+  }, [buildId])
+
+  return { lastUpdate }
 }

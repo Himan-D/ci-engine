@@ -190,6 +190,18 @@ class AuthenticationMiddleware(BaseHTTPMiddleware):
         authorization = request.headers.get("Authorization")
         try:
             token = extract_token_from_header(authorization)
+
+            # ----------------------------------------------------------
+            # Path 1: try as a scoped agent token (ci-agent-… prefix or
+            # falls through to the JWT path on failure)
+            # ----------------------------------------------------------
+            agent_record = self._try_agent_token(token, request)
+            if agent_record is not None:
+                return await call_next(request)
+
+            # ----------------------------------------------------------
+            # Path 2: JWT access token (human user)
+            # ----------------------------------------------------------
             payload = verify_token(token)
 
             if payload.type != "access":
@@ -211,6 +223,40 @@ class AuthenticationMiddleware(BaseHTTPMiddleware):
             )
 
         return await call_next(request)
+
+    def _try_agent_token(self, raw_token: str, request: Request):
+        """Return the AgentToken record if *raw_token* is a valid agent token
+        and the request path is in the allowed-endpoints ACL.
+        Returns None if the token is not an agent token (fall through to JWT).
+        Raises HTTP 403 if it IS an agent token but the path is not allowed.
+        """
+        import fnmatch
+        from ci_engine.server.db import SessionLocal
+        from ci_engine.server.auth import verify_agent_token
+
+        db = SessionLocal()
+        try:
+            record = verify_agent_token(db, raw_token)
+        finally:
+            db.close()
+
+        if record is None:
+            return None  # Not an agent token — let JWT path handle it
+
+        # It IS an agent token — enforce the ACL
+        path = request.url.path
+        allowed = record.get_allowed_endpoints()
+        if any(fnmatch.fnmatch(path, pattern) for pattern in allowed):
+            request.state.agent_id = record.agent_id
+            request.state.is_agent_token = True
+            return record
+
+        # Agent token used on a disallowed endpoint
+        from starlette import status as _status
+        raise HTTPException(
+            status_code=_status.HTTP_403_FORBIDDEN,
+            detail=f"Agent token not permitted on {path}",
+        )
 
 
 security = HTTPBearer(auto_error=False)

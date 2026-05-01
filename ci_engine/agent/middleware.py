@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # CI Engine - Agent Middleware System
 
-from abc import ABC, abstractmethod
+from abc import ABC
 from typing import Optional, Any
 from dataclasses import dataclass
 from enum import Enum

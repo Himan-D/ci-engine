@@ -21,7 +21,7 @@ from sqlalchemy.orm import Session
 from contextlib import asynccontextmanager
 import asyncio
 
-from ci_engine.server.db import get_db, init_db
+from ci_engine.server.db import get_db, init_db, SessionLocal
 from ci_engine.server.models import (
     Build,
     BuildStatus,
@@ -47,6 +47,18 @@ from ci_engine.server.models import (
     WebhookResponse,
     Artifact,
     ArtifactResponse,
+    EnvironmentGroup,
+    EnvironmentGroupResponse,
+    EnvironmentGroupCreate,
+    PipelineTrigger,
+    PipelineTriggerResponse,
+    PipelineTriggerCreate,
+    BuildAnnotation,
+    BuildAnnotationCreate,
+    BuildAnnotationResponse,
+    BuildMetadata,
+    BuildMetadataSet,
+    BuildMetadataResponse,
 )
 from ci_engine.core.pipeline import parse_pipeline
 from ci_engine.server.dashboard import router as dashboard_router
@@ -61,10 +73,21 @@ from ci_engine.server.middleware import (
     limiter,
 )
 from ci_engine.server.webhooks import WebhookService
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from fastapi import UploadFile, File
+from ci_engine.core.artifacts import get_artifact_storage
+from ci_engine.core.cache import get_cache, compute_cache_key
+from ci_engine.server.oidc import OIDCProviderManager, OIDCTokenVerifier, OIDCTokenExchange
+from ci_engine.core.audit import AuditEntry, AuditLogResponse, AuditAction
+from ci_engine.core.secrets import Secret, SecretCreate, SecretResponse
+from ci_engine.server.models_ai import JobAIAnalysis, BuildAISummary
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _main_event_loop
+    _main_event_loop = asyncio.get_running_loop()
     init_db()
     from ci_engine.core.logging import setup_logging
 
@@ -79,7 +102,14 @@ async def lifespan(app: FastAPI):
     except ImportError:
         pass
 
+    # Start background task loops (agent reaper, job timeout, analytics…)
+    from ci_engine.core.background import BackgroundTaskRunner
+    _bg_runner = BackgroundTaskRunner()
+    _bg_runner.start()
+
     yield
+
+    await _bg_runner.stop()
 
     print("Starting graceful shutdown...")
     active_builds = []
@@ -144,9 +174,6 @@ app.add_middleware(
 )
 
 # Rate limiting
-from slowapi import Limiter
-from slowapi.util import get_remote_address
-
 limiter_obj = Limiter(key_func=get_remote_address)
 
 app.state.limiter = limiter_obj
@@ -246,32 +273,96 @@ async def all_builds_stream(websocket: WebSocket):
         manager.disconnect(channel, websocket)
 
 
+_main_event_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _safe_broadcast(coro):
+    """Schedule a broadcast coroutine on the main event loop from any thread.
+
+    FastAPI sync endpoints run in worker threads (anyio threadpool).  We
+    cannot use asyncio.create_task() from there — it requires a running loop
+    in the current thread.  Instead we post to the main loop via
+    run_coroutine_threadsafe, which is the correct cross-thread API.
+    """
+    global _main_event_loop
+    if _main_event_loop is None or _main_event_loop.is_closed():
+        return
+    try:
+        asyncio.run_coroutine_threadsafe(coro, _main_event_loop)
+    except Exception:
+        pass
+
+
+async def _generate_build_summary_async(build_id: int):
+    """Background coroutine: generate LLM build summary after a build completes."""
+    try:
+        from ci_engine.core.ai_analyzer import LLMAnalyzer
+
+        analyzer = LLMAnalyzer()
+        if not analyzer.is_enabled():
+            return
+
+        db = SessionLocal()
+        try:
+            build = db.query(Build).filter(Build.id == build_id).first()
+            if not build:
+                return
+            jobs = db.query(Job).filter(Job.build_id == build_id).all()
+            # Collect ai_fix_applied flags
+            job_dicts = []
+            for j in jobs:
+                analysis = db.query(JobAIAnalysis).filter(JobAIAnalysis.job_id == j.id).first()
+                job_dicts.append({
+                    "id": j.id,
+                    "label": j.label,
+                    "command": j.command,
+                    "status": j.status.value,
+                    "ai_fix_applied": bool(analysis and analysis.fix_applied) if analysis else False,
+                })
+
+            result = analyzer.generate_build_summary(
+                build_id=build_id,
+                branch=build.branch or "unknown",
+                status=build.status.value,
+                jobs=job_dicts,
+            )
+            if result:
+                existing = db.query(BuildAISummary).filter(BuildAISummary.build_id == build_id).first()
+                if existing:
+                    existing.overall_health = result.overall_health
+                    existing.summary = result.summary
+                    existing.what_failed = json.dumps(result.what_failed)
+                    existing.what_was_fixed = json.dumps(result.what_was_fixed)
+                    existing.recommendations = json.dumps(result.recommendations)
+                else:
+                    record = BuildAISummary(
+                        build_id=build_id,
+                        overall_health=result.overall_health,
+                        summary=result.summary,
+                        what_failed=json.dumps(result.what_failed),
+                        what_was_fixed=json.dumps(result.what_was_fixed),
+                        recommendations=json.dumps(result.recommendations),
+                    )
+                    db.add(record)
+                db.commit()
+        finally:
+            db.close()
+    except Exception as exc:
+        import logging as _log
+        _log.getLogger(__name__).warning("_generate_build_summary_async failed: %s", exc)
+
+
 def broadcast_job_status(job_id: int, build_id: int, status: str, exit_code: Optional[int] = None):
     """Broadcast job status change to all subscribers."""
-    asyncio.create_task(
-        manager.broadcast(
-            f"build:{build_id}",
-            {
-                "type": "job_status",
-                "job_id": job_id,
-                "build_id": build_id,
-                "status": status,
-                "exit_code": exit_code,
-            },
-        )
-    )
-    asyncio.create_task(
-        manager.broadcast(
-            "builds:all",
-            {
-                "type": "job_status",
-                "job_id": job_id,
-                "build_id": build_id,
-                "status": status,
-                "exit_code": exit_code,
-            },
-        )
-    )
+    msg = {
+        "type": "job_status",
+        "job_id": job_id,
+        "build_id": build_id,
+        "status": status,
+        "exit_code": exit_code,
+    }
+    _safe_broadcast(manager.broadcast(f"build:{build_id}", msg))
+    _safe_broadcast(manager.broadcast("builds:all", msg))
 
 
 def broadcast_build_status(
@@ -283,34 +374,17 @@ def broadcast_build_status(
     jobs_running: int,
 ):
     """Broadcast build status change to all subscribers."""
-    asyncio.create_task(
-        manager.broadcast(
-            f"build:{build_id}",
-            {
-                "type": "build_status",
-                "build_id": build_id,
-                "status": status,
-                "jobs_total": jobs_total,
-                "jobs_passed": jobs_passed,
-                "jobs_failed": jobs_failed,
-                "jobs_running": jobs_running,
-            },
-        )
-    )
-    asyncio.create_task(
-        manager.broadcast(
-            "builds:all",
-            {
-                "type": "build_status",
-                "build_id": build_id,
-                "status": status,
-                "jobs_total": jobs_total,
-                "jobs_passed": jobs_passed,
-                "jobs_failed": jobs_failed,
-                "jobs_running": jobs_running,
-            },
-        )
-    )
+    msg = {
+        "type": "build_status",
+        "build_id": build_id,
+        "status": status,
+        "jobs_total": jobs_total,
+        "jobs_passed": jobs_passed,
+        "jobs_failed": jobs_failed,
+        "jobs_running": jobs_running,
+    }
+    _safe_broadcast(manager.broadcast(f"build:{build_id}", msg))
+    _safe_broadcast(manager.broadcast("builds:all", msg))
 
 
 app.include_router(dashboard_router)
@@ -337,42 +411,110 @@ def create_build(request: Request, build_data: BuildCreate, db: Session = Depend
     db.refresh(build)
 
     steps = parse_pipeline(build_data.pipeline)
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+    _log.info(f"Creating build #{build.id} with {len(steps)} parsed steps")
     for i, step in enumerate(steps):
         env_vars = step.get("env")
         if env_vars and isinstance(env_vars, list):
             env_vars_dict = {}
             for env in env_vars:
-                if "=" in env:
+                if isinstance(env, str) and "=" in env:
                     key, val = env.split("=", 1)
                     env_vars_dict[key] = val
+                elif isinstance(env, dict):
+                    env_vars_dict.update(env)
             env_vars = json.dumps(env_vars_dict) if env_vars_dict else None
         elif env_vars and isinstance(env_vars, dict):
             env_vars = json.dumps(env_vars)
+        else:
+            env_vars = None
 
         matrix_vars = step.get("matrix_vars")
         skip_condition = step.get("skip_condition")
 
-        job_status = JobStatus.SKIPPED if skip_condition else JobStatus.PENDING
+        # depends_on may be a list from parse_pipeline normalization
+        depends_on = step.get("depends_on") or []
+        if isinstance(depends_on, list):
+            depends_on_str = ",".join(str(d) for d in depends_on) or None
+        else:
+            depends_on_str = str(depends_on) or None
+
+        # Determine node type — explicit node_type/step_type field, or infer from step structure
+        node_type = (
+            step.get("node_type")
+            or step.get("step_type")
+            or "command"
+        )
+        # Normalize aliases
+        if node_type in ("block", "manual", "approval", "gate"):
+            node_type = "wait"
+
+        # continue-on-error support (GitHub Actions style key with hyphen or underscore)
+        coe = bool(
+            step.get("continue_on_error")
+            or step.get("continue-on-error", False)
+        )
+
+        if skip_condition:
+            job_status = JobStatus.SKIPPED
+        elif node_type in ("wait", "block") and depends_on_str:
+            # Wait nodes with dependencies start BLOCKED — they only unblock when deps pass
+            job_status = JobStatus.BLOCKED
+        elif node_type in ("wait", "block") and not depends_on_str:
+            # Wait node with no dependencies starts BLOCKED immediately (first step gate)
+            job_status = JobStatus.BLOCKED
+        else:
+            job_status = JobStatus.PENDING
+
+        # timeout: prefer explicit timeout field, then timeout-minutes converted to seconds
+        timeout_secs = step.get("timeout") or step.get("timeout_seconds") or 3600
+
+        # command: wait/block nodes have no command to execute
+        command = step.get("command") or ("" if node_type in ("wait", "block") else "echo done")
 
         job = Job(
             build_id=build.id,
             step_index=i,
-            label=step.get("label", f"Step {i}"),
-            command=step.get("command", ""),
+            label=step.get("label", f"Step {i + 1}"),
+            command=command,
             status=job_status,
             env_vars=env_vars,
             working_dir=step.get("working_directory"),
-            timeout_seconds=step.get("timeout", 3600),
-            max_retries=step.get("retry", 0),
-            priority=step.get("priority", 0),
+            timeout_seconds=int(timeout_secs),
+            max_retries=int(step.get("retry", 0)),
+            priority=int(step.get("priority", 0)),
             required_tags=step.get("required_tags"),
+            required_skills=step.get("required_skills"),
             matrix_vars=json.dumps(matrix_vars) if matrix_vars else None,
             skip_condition=skip_condition,
+            depends_on=depends_on_str,
+            node_type=node_type,
+            continue_on_error=coe,
+            # Buildkite parity fields
+            soft_fail=bool(step.get("soft_fail", False)),
+            concurrency=step.get("concurrency"),
+            concurrency_group=step.get("concurrency_group"),
+            parallel_group_id=step.get("parallel_group_id"),
+            parallel_index=step.get("parallel_index"),
+            parallel_total=step.get("parallel_total"),
+            queue=step.get("queue", "default"),
         )
-        db.add(job)
+        try:
+            db.add(job)
+            db.flush()  # catch constraint errors per-job, not all at once
+        except Exception as e:
+            db.rollback()
+            _log.error(f"Failed to create job {i} ({step.get('label')}): {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to create job: {e}")
 
-    db.commit()
-    db.refresh(build)
+    try:
+        db.commit()
+        db.refresh(build)
+    except Exception as e:
+        db.rollback()
+        _log.error(f"Failed to commit build #{build.id} jobs: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to save jobs: {e}")
 
     return build
 
@@ -425,9 +567,11 @@ def get_build_jobs(build_id: int, db: Session = Depends(get_db)):
 
 
 # Agent endpoints
-@app.post("/api/agents/register", response_model=AgentResponse)
+@app.post("/api/agents/register")
 def register_agent(agent_data: AgentCreate, db: Session = Depends(get_db)):
-    """Register a new build agent."""
+    """Register a new build agent. Returns agent details + a scoped agent_token."""
+    from ci_engine.server.auth import issue_agent_token
+
     existing = db.query(Agent).filter(Agent.name == agent_data.name).first()
     if existing:
         existing.status = AgentStatus.IDLE
@@ -438,7 +582,10 @@ def register_agent(agent_data: AgentCreate, db: Session = Depends(get_db)):
             existing.skills = ",".join(agent_data.skills)
         db.commit()
         db.refresh(existing)
-        return existing
+        # Issue a fresh scoped token on re-registration
+        agent_token = issue_agent_token(db, existing.id)
+        agent_resp = AgentResponse.model_validate(existing)
+        return {**agent_resp.model_dump(), "agent_token": agent_token}
 
     agent = Agent(
         name=agent_data.name,
@@ -457,7 +604,9 @@ def register_agent(agent_data: AgentCreate, db: Session = Depends(get_db)):
         db.add(skill)
     db.commit()
 
-    return agent
+    agent_token = issue_agent_token(db, agent.id)
+    agent_resp = AgentResponse.model_validate(agent)
+    return {**agent_resp.model_dump(), "agent_token": agent_token}
 
 
 @app.get("/api/agents", response_model=list[AgentResponse])
@@ -823,7 +972,7 @@ def get_agent_labels(agent_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Agent not found")
 
     labels = db.query(AgentLabel).filter(AgentLabel.agent_id == agent_id).all()
-    return [{"id": l.id, "key": l.key, "value": l.value} for l in labels]
+    return [{"id": label.id, "key": label.key, "value": label.value} for label in labels]
 
 
 @app.post("/api/agents/{agent_id}/labels")
@@ -915,31 +1064,150 @@ def upgrade_agent(agent_id: int, db: Session = Depends(get_db)):
 
 
 # Job endpoints
-@app.post("/api/jobs/{job_id}/claim")
-def claim_job(job_id: int, agent_id: int, db: Session = Depends(get_db)):
-    """Agent claims a job to execute."""
+@app.get("/api/jobs/pending", tags=["jobs"])
+def get_pending_jobs(db: Session = Depends(get_db)):
+    """Return pending jobs ready to run — dependencies satisfied, across all active builds.
+
+    Only returns jobs whose depends_on requirements are all PASSED/SKIPPED so
+    agents never pick up a job before its predecessors have finished.
+    """
+    from ci_engine.core.secrets import get_active_secrets
+
+    candidate_jobs = (
+        db.query(Job)
+        .join(Build, Job.build_id == Build.id)
+        .filter(
+            Job.status == JobStatus.PENDING,
+            Build.status.in_([BuildStatus.PENDING, BuildStatus.RUNNING]),
+        )
+        .order_by(Job.priority.desc(), Job.id)
+        .limit(50)
+        .all()
+    )
+
+    ready = []
+    for j in candidate_jobs:
+        # Skip wait/block nodes — they need manual unblocking, not agent execution
+        if j.node_type in ("wait", "block"):
+            continue
+
+        if j.depends_on:
+            deps = [d.strip() for d in j.depends_on.split(",") if d.strip()]
+            sibling_jobs = db.query(Job).filter(Job.build_id == j.build_id).all()
+            by_label = {sj.label: sj for sj in sibling_jobs}
+            by_index = {sj.step_index: sj for sj in sibling_jobs}
+
+            deps_satisfied = True
+            for dep in deps:
+                dep_job = by_label.get(dep) or (
+                    by_index.get(int(dep)) if dep.isdigit() else None
+                )
+                if dep_job and dep_job.status not in (JobStatus.PASSED, JobStatus.SKIPPED):
+                    deps_satisfied = False
+                    break
+            if not deps_satisfied:
+                continue
+
+        # Fetch build info for repository context
+        build = db.query(Build).filter(Build.id == j.build_id).first()
+        build_info = {}
+        if build:
+            build_info = {
+                "id": build.id,
+                "repository": build.repository,
+                "branch": build.branch,
+                "commit": build.commit,
+                "clone_depth": build.clone_depth,
+            }
+
+        # Inject active secrets as env vars (scoped to build repository)
+        secrets_env: dict[str, str] = {}
+        try:
+            repo = build.repository if build else None
+            secrets_env = get_active_secrets(db, repository=repo)
+        except Exception:
+            pass
+
+        # Merge job-level env_vars with secrets (secrets don't override explicit vars)
+        job_env: dict = {}
+        if j.env_vars:
+            try:
+                import json as _json
+                job_env = _json.loads(j.env_vars)
+            except Exception:
+                pass
+        merged_env = {**secrets_env, **job_env}
+
+        ready.append({
+            "id": j.id,
+            "build_id": j.build_id,
+            "label": j.label,
+            "command": j.command,
+            "status": j.status.value,
+            "timeout_seconds": j.timeout_seconds,
+            "env_vars": merged_env,
+            "container_image": None,
+            "depends_on": j.depends_on,
+            "node_type": j.node_type or "command",
+            "continue_on_error": bool(j.continue_on_error),
+            "build": build_info,
+        })
+
+        if len(ready) >= 10:
+            break
+
+    return ready
+
+
+@app.get("/api/jobs/{job_id}", tags=["jobs"])
+def get_job(job_id: int, db: Session = Depends(get_db)):
+    """Get a single job by ID — used by agents to check cancellation status."""
     job = db.query(Job).filter(Job.id == job_id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    return {
+        "id": job.id,
+        "build_id": job.build_id,
+        "label": job.label,
+        "command": job.command,
+        "status": job.status.value,
+        "exit_code": job.exit_code,
+        "agent_id": job.agent_id,
+        "started_at": job.started_at.isoformat() if job.started_at else None,
+        "finished_at": job.finished_at.isoformat() if job.finished_at else None,
+        "timeout_seconds": job.timeout_seconds,
+        "retry_count": job.retry_count,
+        "max_retries": job.max_retries,
+    }
 
-    if job.status != JobStatus.PENDING:
-        raise HTTPException(status_code=400, detail="Job not available")
+
+@app.post("/api/jobs/{job_id}/claim")
+def claim_job(job_id: int, agent_id: int, db: Session = Depends(get_db)):
+    """Agent claims a job to execute (atomic, race-condition-safe)."""
+    from ci_engine.core.locking import claim_job_atomic
+
+    # Validate existence before attempting atomic claim
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
 
     agent = db.query(Agent).filter(Agent.id == agent_id).first()
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
 
-    job.agent_id = agent_id
-    job.status = JobStatus.ASSIGNED
-    agent.status = AgentStatus.BUSY
+    success = claim_job_atomic(db, job_id, agent_id)
+    if not success:
+        raise HTTPException(status_code=409, detail="Job already claimed by another agent")
 
-    db.commit()
-    return {"status": "claimed", "job_id": job.id}
+    return {"status": "claimed", "job_id": job_id}
 
 
 @app.post("/api/jobs/{job_id}/start")
 def start_job(job_id: int, db: Session = Depends(get_db)):
     """Mark job as started."""
+    from ci_engine.core.notifications import send_build_notification, send_job_notification
+    from ci_engine.core.notifications import NotificationEvent
+
     job = db.query(Job).filter(Job.id == job_id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -948,6 +1216,7 @@ def start_job(job_id: int, db: Session = Depends(get_db)):
     job.started_at = datetime.now(timezone.utc)
 
     build = db.query(Build).filter(Build.id == job.build_id).first()
+    build_was_pending = build and build.status == BuildStatus.PENDING
     if build and build.status == BuildStatus.PENDING:
         build.status = BuildStatus.RUNNING
         build.started_at = datetime.now(timezone.utc)
@@ -955,6 +1224,30 @@ def start_job(job_id: int, db: Session = Depends(get_db)):
     db.commit()
 
     broadcast_job_status(job_id, job.build_id, "running")
+
+    # Report build started to GitHub/GitLab
+    if build_was_pending and build:
+        try:
+            from ci_engine.core.git_status import get_reporter as get_git_reporter
+            external_repo = getattr(build, "external_repo", None)
+            head_sha = getattr(build, "head_sha", None)
+            get_git_reporter().report_build_started(build.id, head_sha, external_repo)
+        except Exception:
+            pass
+
+    # Fire notifications (background — don't block the agent)
+    try:
+        job_data = {"id": job.id, "label": job.label, "status": "running"}
+        build_data = {
+            "id": build.id, "branch": build.branch,
+            "commit": build.commit, "status": "running",
+        } if build else {}
+        send_job_notification(NotificationEvent.JOB_STARTED, job_data, build_data)
+        if build_was_pending:
+            send_build_notification(NotificationEvent.BUILD_STARTED, build_data)
+    except Exception:
+        pass
+
     return {"status": "started"}
 
 
@@ -967,15 +1260,34 @@ def complete_job(job_id: int, exit_code: int, db: Session = Depends(get_db)):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    job.status = JobStatus.PASSED if exit_code == 0 else JobStatus.FAILED
+    # Determine job outcome — continue_on_error jobs that fail are treated
+    # as PASSED for dependency resolution so downstream jobs can still run.
+    # We store the real exit_code but treat the status as PASSED.
+    effective_failed = exit_code != 0
     job.exit_code = exit_code
     job.finished_at = datetime.now(timezone.utc)
 
     if job.agent:
         job.agent.status = AgentStatus.IDLE
 
+    # continue_on_error / soft_fail: different treatment of failures.
+    # - continue_on_error: treated as PASSED so downstream runs, but exit_code visible in UI.
+    # - soft_fail: stored as SOFT_FAILED — downstream runs, build doesn't fail.
+    # - hard fail: FAILED status, may cascade-skip downstream.
+    continue_on_error = bool(getattr(job, "continue_on_error", False))
+    soft_fail = bool(getattr(job, "soft_fail", False))
+
+    if effective_failed and soft_fail:
+        job.status = JobStatus.SOFT_FAILED
+    elif effective_failed and not continue_on_error:
+        job.status = JobStatus.FAILED
+    else:
+        job.status = JobStatus.PASSED
+
     db.commit()
 
+    # Update downstream job statuses (unblock those whose deps are now met,
+    # skip those whose deps failed).
     Scheduler.check_and_update_dependencies(db, job.build_id)
 
     retry_triggered = False
@@ -986,13 +1298,17 @@ def complete_job(job_id: int, exit_code: int, db: Session = Depends(get_db)):
             retry_triggered = True
 
     if not retry_triggered:
-        pending_jobs = (
+        # Build is complete when no more jobs are pending/running/assigned
+        active_count = (
             db.query(Job)
-            .filter(Job.build_id == job.build_id, Job.status == JobStatus.PENDING)
+            .filter(
+                Job.build_id == job.build_id,
+                Job.status.in_([JobStatus.PENDING, JobStatus.RUNNING, JobStatus.ASSIGNED]),
+            )
             .count()
         )
 
-        if pending_jobs == 0:
+        if active_count == 0:
             build = db.query(Build).filter(Build.id == job.build_id).first()
             if build:
                 failed_jobs = (
@@ -1018,10 +1334,72 @@ def complete_job(job_id: int, exit_code: int, db: Session = Depends(get_db)):
             db.query(Job).filter(Job.build_id == build.id, Job.status == JobStatus.RUNNING).count()
         )
 
-        broadcast_job_status(job_id, job.build_id.value, job.status.value, exit_code)
+        broadcast_job_status(job_id, job.build_id, job.status.value, exit_code)
         broadcast_build_status(
             build.id, build.status.value, jobs_total, jobs_passed, jobs_failed, jobs_running
         )
+
+    # Fire notifications
+    try:
+        from ci_engine.core.notifications import send_build_notification, send_job_notification
+        from ci_engine.core.notifications import NotificationEvent
+
+        job_data = {
+            "id": job.id, "label": job.label,
+            "status": job.status.value, "exit_code": exit_code,
+        }
+        build_data = {
+            "id": build.id, "branch": build.branch,
+            "commit": build.commit, "status": build.status.value,
+        } if build else {}
+
+        if job.status == JobStatus.FAILED:
+            send_job_notification(NotificationEvent.JOB_FAILED, job_data, build_data)
+        else:
+            send_job_notification(NotificationEvent.JOB_COMPLETED, job_data, build_data)
+
+        if build and build.status in (BuildStatus.PASSED, BuildStatus.FAILED):
+            if build.status == BuildStatus.PASSED:
+                send_build_notification(NotificationEvent.BUILD_COMPLETED, build_data)
+            else:
+                send_build_notification(NotificationEvent.BUILD_FAILED, build_data)
+    except Exception:
+        pass
+
+    # Report build completion to GitHub/GitLab + materialise analytics
+    if build and build.status in (BuildStatus.PASSED, BuildStatus.FAILED):
+        try:
+            from ci_engine.core.git_status import get_reporter as get_git_reporter
+            from ci_engine.core.analytics import materialise_build_metrics
+            external_repo = getattr(build, "external_repo", None)
+            head_sha = getattr(build, "head_sha", None)
+            pr_number = getattr(build, "pr_number", None)
+            is_passed = build.status == BuildStatus.PASSED
+            reporter = get_git_reporter()
+            reporter.report_build_completed(
+                build.id, head_sha, external_repo, passed=is_passed,
+            )
+            # Post PR comment with build summary
+            if pr_number:
+                failed_job_labels = [
+                    j.label for j in db.query(Job).filter(
+                        Job.build_id == build.id, Job.status == JobStatus.FAILED
+                    ).all()
+                ]
+                reporter.post_pr_comment(
+                    external_repo=external_repo,
+                    pr_number=pr_number,
+                    build_id=build.id,
+                    passed=is_passed,
+                    failed_jobs=failed_job_labels,
+                )
+            materialise_build_metrics(db, build.id)
+        except Exception:
+            pass
+
+    # Trigger async AI build summary when the build reaches a terminal state
+    if build and build.status in (BuildStatus.PASSED, BuildStatus.FAILED):
+        _safe_broadcast(_generate_build_summary_async(build.id))
 
     if retry_triggered:
         return {
@@ -1034,13 +1412,213 @@ def complete_job(job_id: int, exit_code: int, db: Session = Depends(get_db)):
     return {"status": "completed", "exit_code": exit_code}
 
 
+@app.get("/api/jobs/{job_id}/logs", tags=["jobs"])
+def get_job_logs(job_id: int, db: Session = Depends(get_db)):
+    """Get all stored log lines for a job."""
+    logs = db.query(JobLog).filter(JobLog.job_id == job_id).order_by(JobLog.id).all()
+    return {
+        "job_id": job_id,
+        "lines": [
+            {"line_number": i + 1, "content": log.line, "stream": log.stream, "timestamp": log.timestamp}
+            for i, log in enumerate(logs)
+        ],
+    }
+
+
 @app.post("/api/jobs/{job_id}/log")
-def append_log(job_id: int, stream: str, line: str, db: Session = Depends(get_db)):
-    """Append log line to job."""
-    log = JobLog(job_id=job_id, stream=stream, line=line)
-    db.add(log)
+async def append_log(
+    job_id: int,
+    request: Request,
+    stream: Optional[str] = None,
+    line: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    """Append a log line to a job — accepts query params OR JSON body.
+
+    Agents send logs as query params: ?stream=stdout&line=text
+    Fallback: JSON body {"stream": "stdout", "line": "text"}
+    """
+    if stream is None or line is None:
+        try:
+            body = await request.json()
+            stream = stream or body.get("stream", "stdout")
+            line = line if line is not None else body.get("line", "")
+        except Exception:
+            stream = stream or "stdout"
+            line = line or ""
+
+    log_entry = JobLog(job_id=job_id, stream=stream, line=line)
+    db.add(log_entry)
     db.commit()
+
+    # Broadcast to any live WebSocket subscribers
+    await manager.broadcast(
+        f"job_{job_id}_logs",
+        {"type": "log", "job_id": job_id, "stream": stream, "content": line},
+    )
+
     return {"status": "logged"}
+
+
+# ---------------------------------------------------------------------------
+# AI Analysis endpoints
+# ---------------------------------------------------------------------------
+
+class JobAIAnalysisCreate(BaseModel):
+    root_cause: str = ""
+    error_category: str = "unknown"
+    explanation: str = ""
+    fixed_command: Optional[str] = None
+    confidence: float = 0.5
+    pipeline_suggestion: Optional[str] = None
+    provider: Optional[str] = None
+    model: Optional[str] = None
+
+
+class JobAIAnalysisResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    job_id: int
+    root_cause: Optional[str] = None
+    error_category: Optional[str] = None
+    explanation: Optional[str] = None
+    fixed_command: Optional[str] = None
+    fix_applied: bool = False
+    confidence: Optional[float] = None
+    pipeline_suggestion: Optional[str] = None
+    provider: Optional[str] = None
+    model: Optional[str] = None
+
+
+class AIFixRequest(BaseModel):
+    fixed_command: str
+
+
+class BuildAISummaryCreate(BaseModel):
+    overall_health: str = "unknown"
+    summary: str = ""
+    what_failed: list[str] = []
+    what_was_fixed: list[str] = []
+    recommendations: list[str] = []
+
+
+class BuildAISummaryResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    build_id: int
+    overall_health: Optional[str] = None
+    summary: Optional[str] = None
+    what_failed: Optional[str] = None
+    what_was_fixed: Optional[str] = None
+    recommendations: Optional[str] = None
+
+
+@app.post("/api/jobs/{job_id}/ai-analysis", response_model=JobAIAnalysisResponse, tags=["ai"])
+def store_job_ai_analysis(job_id: int, body: JobAIAnalysisCreate, db: Session = Depends(get_db)):
+    """Agent plugin stores AI analysis for a failed job (upsert)."""
+    existing = db.query(JobAIAnalysis).filter(JobAIAnalysis.job_id == job_id).first()
+    if existing:
+        existing.root_cause = body.root_cause
+        existing.error_category = body.error_category
+        existing.explanation = body.explanation
+        existing.fixed_command = body.fixed_command
+        existing.confidence = body.confidence
+        existing.pipeline_suggestion = body.pipeline_suggestion
+        existing.provider = body.provider
+        existing.model = body.model
+        db.commit()
+        db.refresh(existing)
+        return existing
+    analysis = JobAIAnalysis(
+        job_id=job_id,
+        root_cause=body.root_cause,
+        error_category=body.error_category,
+        explanation=body.explanation,
+        fixed_command=body.fixed_command,
+        confidence=body.confidence,
+        pipeline_suggestion=body.pipeline_suggestion,
+        provider=body.provider,
+        model=body.model,
+    )
+    db.add(analysis)
+    db.commit()
+    db.refresh(analysis)
+    return analysis
+
+
+@app.get("/api/jobs/{job_id}/ai-analysis", response_model=JobAIAnalysisResponse, tags=["ai"])
+def get_job_ai_analysis(job_id: int, db: Session = Depends(get_db)):
+    """Frontend fetches AI analysis for a failed job."""
+    analysis = db.query(JobAIAnalysis).filter(JobAIAnalysis.job_id == job_id).first()
+    if not analysis:
+        raise HTTPException(status_code=404, detail="No AI analysis for this job")
+    return analysis
+
+
+@app.post("/api/jobs/{job_id}/ai-fix", tags=["ai"])
+def apply_ai_fix(job_id: int, body: AIFixRequest, db: Session = Depends(get_db)):
+    """Agent plugin triggers autonomous retry with a fixed command."""
+    from ci_engine.core.scheduler import Scheduler
+
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status != JobStatus.FAILED:
+        raise HTTPException(status_code=400, detail="Job is not in FAILED state")
+    if job.retry_count >= job.max_retries:
+        raise HTTPException(status_code=400, detail="Retry budget exhausted")
+
+    # Patch the command with the AI-suggested fix
+    job.command = body.fixed_command
+
+    # Mark analysis as fix_applied
+    analysis = db.query(JobAIAnalysis).filter(JobAIAnalysis.job_id == job_id).first()
+    if analysis:
+        analysis.fix_applied = True
+    db.commit()
+
+    # Use existing retry mechanism
+    retried = Scheduler.retry_job(db, job)
+    if not retried:
+        raise HTTPException(status_code=500, detail="Retry failed — check retry budget")
+
+    return {"status": "retry_triggered", "new_command": body.fixed_command, "job_id": job_id}
+
+
+@app.get("/api/builds/{build_id}/ai-summary", response_model=BuildAISummaryResponse, tags=["ai"])
+def get_build_ai_summary(build_id: int, db: Session = Depends(get_db)):
+    """Frontend fetches AI summary for a completed build."""
+    summary = db.query(BuildAISummary).filter(BuildAISummary.build_id == build_id).first()
+    if not summary:
+        raise HTTPException(status_code=404, detail="No AI summary for this build")
+    return summary
+
+
+@app.post("/api/builds/{build_id}/ai-summary", response_model=BuildAISummaryResponse, tags=["ai"])
+def store_build_ai_summary(build_id: int, body: BuildAISummaryCreate, db: Session = Depends(get_db)):
+    """Background task stores LLM build summary (upsert)."""
+    existing = db.query(BuildAISummary).filter(BuildAISummary.build_id == build_id).first()
+    if existing:
+        existing.overall_health = body.overall_health
+        existing.summary = body.summary
+        existing.what_failed = json.dumps(body.what_failed)
+        existing.what_was_fixed = json.dumps(body.what_was_fixed)
+        existing.recommendations = json.dumps(body.recommendations)
+        db.commit()
+        db.refresh(existing)
+        return existing
+    record = BuildAISummary(
+        build_id=build_id,
+        overall_health=body.overall_health,
+        summary=body.summary,
+        what_failed=json.dumps(body.what_failed),
+        what_was_fixed=json.dumps(body.what_was_fixed),
+        recommendations=json.dumps(body.recommendations),
+    )
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+    return record
 
 
 # WebSocket for log streaming with job log storage
@@ -1099,6 +1677,44 @@ async def websocket_logs(websocket: WebSocket, job_id: int):
 @app.get("/health")
 def health_check():
     return {"status": "healthy"}
+
+
+@app.get("/api/ai/status", tags=["ai"])
+def ai_provider_status():
+    """Return which LLM providers are configured and which is active.
+
+    Powered by litellm — a unified interface to 100+ LLM providers.
+    """
+    from ci_engine.core.llm_providers import provider_status, discover_provider, list_available_providers
+
+    active = discover_provider()
+    available = list_available_providers()
+
+    # litellm version (best-effort)
+    litellm_version = None
+    try:
+        import importlib.metadata
+        litellm_version = importlib.metadata.version("litellm")
+    except Exception:
+        pass
+
+    return {
+        "enabled": active is not None,
+        "backend": "litellm",
+        "litellm_version": litellm_version,
+        "active_provider": active.name if active else None,
+        "active_analysis_model": active.get_analysis_model() if active else None,
+        "active_summary_model": active.get_summary_model() if active else None,
+        "available_providers": [p.name for p in available],
+        "providers": provider_status(),
+        "config": {
+            "CI_ENGINE_LLM_PROVIDER": os.environ.get("CI_ENGINE_LLM_PROVIDER") or "(auto)",
+            "CI_ENGINE_AI_ANALYSIS_MODEL": os.environ.get("CI_ENGINE_AI_ANALYSIS_MODEL") or "(provider default)",
+            "CI_ENGINE_AI_SUMMARY_MODEL": os.environ.get("CI_ENGINE_AI_SUMMARY_MODEL") or "(provider default)",
+            "CI_ENGINE_AI_AUTO_FIX": os.environ.get("CI_ENGINE_AI_AUTO_FIX", "true"),
+            "CI_ENGINE_AI_MAX_LOG_LINES": os.environ.get("CI_ENGINE_AI_MAX_LOG_LINES", "200"),
+        },
+    }
 
 
 @app.get("/health/deep")
@@ -1449,27 +2065,81 @@ def cancel_job(job_id: int, db: Session = Depends(get_db)):
 
 
 @app.post("/api/builds/{build_id}/unblock", response_model=BuildResponse, tags=["builds"])
-def unblock_build(build_id: int, db: Session = Depends(get_db)):
-    """Unblock a blocked build, triggering pending jobs."""
+def unblock_build(build_id: int, step: Optional[str] = None, db: Session = Depends(get_db)):
+    """Unblock a blocked build or a specific wait/block step.
+
+    - If `step` is provided: unblock only that named step (label match).
+    - Otherwise: unblock the first (lowest step_index) wait/block node that is BLOCKED
+      and whose dependencies are all satisfied.
+    """
+    from ci_engine.core.scheduler import Scheduler
+
     build = db.query(Build).filter(Build.id == build_id).first()
     if not build:
         raise HTTPException(status_code=404, detail="Build not found")
 
-    blocked_jobs = (
-        db.query(Job).filter(Job.build_id == build_id, Job.status == JobStatus.BLOCKED).all()
-    )
+    all_jobs = db.query(Job).filter(Job.build_id == build_id).all()
+    blocked_wait_jobs = [
+        j for j in all_jobs
+        if j.status == JobStatus.BLOCKED and j.node_type in ("wait", "block")
+    ]
 
-    if not blocked_jobs:
-        raise HTTPException(status_code=400, detail="No blocked jobs to unblock")
+    if not blocked_wait_jobs:
+        # Fall back: unblock ANY blocked job (e.g. dependency-blocked jobs now ready)
+        blocked_jobs = [j for j in all_jobs if j.status == JobStatus.BLOCKED]
+        if not blocked_jobs:
+            raise HTTPException(status_code=400, detail="No blocked jobs to unblock")
+        for j in blocked_jobs:
+            j.status = JobStatus.PENDING
+    else:
+        # If a specific step was requested, unblock only that step
+        if step:
+            target = next((j for j in blocked_wait_jobs if j.label == step), None)
+            if not target:
+                raise HTTPException(status_code=404, detail=f"No blocked wait step named '{step}'")
+            jobs_to_unblock = [target]
+        else:
+            # Unblock the lowest-index wait/block step that has its deps satisfied
+            by_label = {j.label: j for j in all_jobs}
+            by_index = {j.step_index: j for j in all_jobs}
+            ready_waits = []
+            for j in sorted(blocked_wait_jobs, key=lambda x: x.step_index):
+                deps_ok = True
+                if j.depends_on:
+                    for dep in j.depends_on.split(","):
+                        dep = dep.strip()
+                        dep_job = by_label.get(dep) or (by_index.get(int(dep)) if dep.isdigit() else None)
+                        if dep_job and dep_job.status not in (JobStatus.PASSED, JobStatus.SKIPPED):
+                            deps_ok = False
+                            break
+                if deps_ok:
+                    ready_waits.append(j)
+            jobs_to_unblock = ready_waits[:1] if ready_waits else blocked_wait_jobs[:1]
 
-    for job in blocked_jobs:
-        job.status = JobStatus.PENDING
+        for j in jobs_to_unblock:
+            # Wait/block nodes pass immediately when unblocked — no command to run
+            j.status = JobStatus.PASSED
+            j.finished_at = datetime.now(timezone.utc)
+            broadcast_job_status(j.id, build_id, "passed", 0)
 
     if build.status == BuildStatus.PENDING:
         build.status = BuildStatus.RUNNING
 
     db.commit()
+
+    # Run dependency resolution so jobs waiting on this gate become runnable
+    Scheduler.check_and_update_dependencies(db, build_id)
+
     db.refresh(build)
+
+    broadcast_build_status(
+        build.id, build.status.value,
+        len(all_jobs),
+        sum(1 for j in all_jobs if j.status == JobStatus.PASSED),
+        sum(1 for j in all_jobs if j.status == JobStatus.FAILED),
+        sum(1 for j in all_jobs if j.status == JobStatus.RUNNING),
+    )
+
     return build
 
 
@@ -1485,6 +2155,98 @@ def agent_heartbeat(agent_id: int, db: Session = Depends(get_db)):
     agent.status = AgentStatus.IDLE
     db.commit()
     return {"status": "ok", "agent_id": agent_id}
+
+
+def _create_build_from_webhook(db, build_info: dict) -> dict:
+    """Create a build from webhook event data.
+
+    Looks up a registered pipeline for the repository, or uses a sensible
+    default that actually works for most projects.  The pipeline can be
+    overridden per-repository via the pipeline_triggers table.
+    """
+    repo = build_info.get("repository", "")
+    branch = build_info.get("branch", "main")
+
+    # Look for a saved pipeline trigger that matches this repository
+    pipeline_yaml = None
+    trigger = (
+        db.query(PipelineTrigger).filter(PipelineTrigger.name == repo).first()
+        or db.query(PipelineTrigger).filter(PipelineTrigger.pipeline.contains(repo)).first()
+    )
+    if trigger:
+        pipeline_yaml = trigger.pipeline
+
+    if not pipeline_yaml:
+        # Sensible default: detect common CI patterns
+        pipeline_yaml = f"""
+env:
+  REPO: "{repo}"
+  BRANCH: "{branch}"
+
+steps:
+  - label: "Checkout & Install"
+    command: |
+      echo "Repository: {repo}"
+      echo "Branch: {branch}"
+      if [ -f package.json ]; then npm ci; fi
+      if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+      if [ -f Gemfile ]; then bundle install; fi
+      if [ -f go.mod ]; then go mod download; fi
+
+  - label: "Build"
+    command: |
+      if [ -f Makefile ] && grep -q '^build:' Makefile; then make build
+      elif [ -f package.json ] && grep -q '"build"' package.json; then npm run build
+      elif [ -f go.mod ]; then go build ./...
+      else echo "No build step detected — skipping"
+      fi
+    depends_on: ["Checkout & Install"]
+
+  - label: "Test"
+    command: |
+      if [ -f Makefile ] && grep -q '^test:' Makefile; then make test
+      elif [ -f package.json ] && grep -q '"test"' package.json; then npm test
+      elif [ -f pytest.ini ] || [ -f setup.cfg ] || [ -f pyproject.toml ]; then pytest
+      elif [ -f go.mod ]; then go test ./...
+      else echo "No test step detected — skipping"
+      fi
+    depends_on: ["Build"]
+    continue-on-error: false
+"""
+
+    build = Build(
+        pipeline=pipeline_yaml,
+        branch=branch,
+        commit=build_info.get("commit"),
+        repository=repo,
+        git_ref=branch,
+        status=BuildStatus.PENDING,
+    )
+    db.add(build)
+    db.commit()
+
+    steps = parse_pipeline(pipeline_yaml)
+    for i, step in enumerate(steps):
+        depends_on = step.get("depends_on") or []
+        if isinstance(depends_on, list):
+            depends_on_str = ",".join(depends_on)
+        else:
+            depends_on_str = str(depends_on)
+
+        job = Job(
+            build_id=build.id,
+            step_index=i,
+            label=step.get("label", f"Step {i + 1}"),
+            command=step.get("command", "echo done"),
+            status=JobStatus.PENDING,
+            depends_on=depends_on_str or None,
+            timeout_seconds=step.get("timeout", 3600),
+            max_retries=step.get("retry", 0),
+        )
+        db.add(job)
+    db.commit()
+
+    return {"status": "created", "build_id": build.id, "steps": len(steps)}
 
 
 # Webhook endpoints
@@ -1559,36 +2321,7 @@ def github_webhook(
     if event:
         build_info = WebhookService.extract_build_info(event)
         if build_info:
-            pipeline = """
-steps:
-  - label: "Build"
-    command: "make build"
-  - label: "Test"
-    command: "make test"
-"""
-            build = Build(
-                pipeline=pipeline,
-                branch=build_info.get("branch", "main"),
-                commit=build_info.get("commit"),
-                repository=build_info.get("repository"),
-                git_ref=build_info.get("branch", "main"),
-                status=BuildStatus.PENDING,
-            )
-            db.add(build)
-            db.commit()
-
-            steps = parse_pipeline(pipeline)
-            for i, step in enumerate(steps):
-                job = Job(
-                    build_id=build.id,
-                    step_index=i,
-                    label=step.get("label", f"Step {i}"),
-                    command=step.get("command", ""),
-                    status=JobStatus.PENDING,
-                )
-                db.add(job)
-            db.commit()
-            return {"status": "created", "build_id": build.id}
+            return _create_build_from_webhook(db, build_info)
 
     return {"status": "received"}
 
@@ -1619,46 +2352,15 @@ def gitlab_webhook(
     if event:
         build_info = WebhookService.extract_build_info(event)
         if build_info:
-            pipeline = """
-steps:
-  - label: "Build"
-    command: "make build"
-  - label: "Test"
-    command: "make test"
-"""
-            build = Build(
-                pipeline=pipeline,
-                branch=build_info.get("branch", "main"),
-                commit=build_info.get("commit"),
-                repository=build_info.get("repository"),
-                git_ref=build_info.get("branch", "main"),
-                status=BuildStatus.PENDING,
-            )
-            db.add(build)
-            db.commit()
-
-            steps = parse_pipeline(pipeline)
-            for i, step in enumerate(steps):
-                job = Job(
-                    build_id=build.id,
-                    step_index=i,
-                    label=step.get("label", f"Step {i}"),
-                    command=step.get("command", ""),
-                    status=JobStatus.PENDING,
-                )
-                db.add(job)
-            db.commit()
-            return {"status": "created", "build_id": build.id}
+            return _create_build_from_webhook(db, build_info)
 
     return {"status": "received"}
 
 
 # Artifact endpoints
-from fastapi import UploadFile, File
-from ci_engine.core.artifacts import get_artifact_storage
 
 
-@app.post("/api/artifacts", response_model=ArtifactResponse, tags=["artifacts"])
+@ app.post("/api/artifacts", response_model=ArtifactResponse, tags=["artifacts"])
 async def upload_artifact(
     build_id: int,
     job_id: Optional[int] = None,
@@ -1748,7 +2450,6 @@ async def download_artifact(artifact_id: int, db: Session = Depends(get_db)):
 
 
 # Cache endpoints
-from ci_engine.core.cache import get_cache, compute_cache_key
 
 
 @app.get("/api/cache", tags=["cache"])
@@ -1908,7 +2609,6 @@ def reap_offline_agents(timeout_minutes: int = 5, db: Session = Depends(get_db))
 
 
 # OIDC endpoints
-from ci_engine.server.oidc import OIDCProviderManager, OIDCTokenVerifier, OIDCTokenExchange
 
 
 @app.get("/api/oidc/config", tags=["oidc"])
@@ -1977,7 +2677,6 @@ def exchange_oidc_token(provider: str, token: str):
 
 
 # Audit log endpoints
-from ci_engine.core.audit import AuditEntry, AuditLogResponse, AuditAction
 
 
 @app.get("/api/audit-logs", response_model=list[AuditLogResponse], tags=["audit"])
@@ -2014,24 +2713,36 @@ def list_audit_actions():
 
 
 # Secrets management endpoints
-from ci_engine.core.secrets import Secret, SecretCreate, SecretResponse
 
 
 @app.get("/api/secrets", response_model=list[SecretResponse], tags=["secrets"])
 def list_secrets(db: Session = Depends(get_db)):
     """List all secrets (without values)."""
-    secrets = db.query(Secret).filter(Secret.is_active == True).all()
+    secrets = db.query(Secret).filter(Secret.is_active).all()
     return secrets
 
 
 @app.post("/api/secrets", response_model=SecretResponse, tags=["secrets"])
 def create_secret(secret_data: SecretCreate, db: Session = Depends(get_db)):
-    """Create a new secret."""
+    """Create a new secret. Optionally scoped to a repository via ``repository`` field."""
     from ci_engine.core.secrets import _encrypt_value
 
-    existing = db.query(Secret).filter(Secret.name == secret_data.name).first()
+    # Allow same name for different repos; only block global duplicates
+    existing = (
+        db.query(Secret)
+        .filter(
+            Secret.name == secret_data.name,
+            Secret.repository == secret_data.repository,
+            Secret.is_active,
+        )
+        .first()
+    )
     if existing:
-        raise HTTPException(status_code=400, detail="Secret already exists")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Secret '{secret_data.name}' already exists"
+            + (f" for repository '{secret_data.repository}'" if secret_data.repository else " (global)"),
+        )
 
     encrypted, version = _encrypt_value(secret_data.value)
 
@@ -2040,6 +2751,7 @@ def create_secret(secret_data: SecretCreate, db: Session = Depends(get_db)):
         value_encrypted=encrypted,
         key_version=version,
         created_by=secret_data.created_by,
+        repository=secret_data.repository,
     )
     db.add(secret)
     db.commit()
@@ -2335,3 +3047,730 @@ def delete_trigger(
     db.commit()
 
     return {"status": "deleted", "trigger_id": trigger_id}
+
+
+# ===========================================================================
+# Feature 6 — Pipeline validation (lint) endpoint
+# ===========================================================================
+
+class PipelineValidateRequest(BaseModel):
+    pipeline_yaml: str
+
+
+@app.post("/api/pipelines/validate", tags=["pipelines"])
+def validate_pipeline(body: PipelineValidateRequest):
+    """Lint a pipeline YAML and return validation errors/warnings."""
+    from ci_engine.core.pipeline_lint import lint_pipeline
+    result = lint_pipeline(body.pipeline_yaml)
+    return result.as_dict()
+
+
+# ===========================================================================
+# Feature 7 — Test result ingestion + flakiness
+# ===========================================================================
+
+class TestResultsUpload(BaseModel):
+    content: str
+    content_type: str = ""  # application/xml or application/json
+    repository: Optional[str] = None
+
+
+@app.post("/api/jobs/{job_id}/test-results", tags=["test-results"])
+def upload_test_results(
+    job_id: int,
+    body: TestResultsUpload,
+    db: Session = Depends(get_db),
+):
+    """Ingest JUnit XML or CTRF JSON test results for a job."""
+    from ci_engine.core.test_parser import parse_test_results
+    from ci_engine.server.models_extensions import TestRun
+
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    parsed = parse_test_results(body.content, body.content_type)
+    if not parsed:
+        raise HTTPException(status_code=422, detail="No test cases found in payload")
+
+    repository = body.repository or getattr(
+        db.query(Build).filter(Build.id == job.build_id).first(), "repository", None
+    )
+
+    rows = [
+        TestRun(
+            job_id=job_id,
+            build_id=job.build_id,
+            repository=repository,
+            test_name=t["test_name"],
+            test_suite=t.get("test_suite"),
+            status=t["status"],
+            duration_ms=t.get("duration_ms"),
+            failure_message=t.get("failure_message"),
+            failure_type=t.get("failure_type"),
+        )
+        for t in parsed
+    ]
+    db.add_all(rows)
+    try:
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    return {
+        "inserted": len(rows),
+        "job_id": job_id,
+        "summary": {
+            "passed": sum(1 for t in parsed if t["status"] == "passed"),
+            "failed": sum(1 for t in parsed if t["status"] == "failed"),
+            "skipped": sum(1 for t in parsed if t["status"] == "skipped"),
+            "errored": sum(1 for t in parsed if t["status"] == "errored"),
+        },
+    }
+
+
+@app.get("/api/jobs/{job_id}/test-results", tags=["test-results"])
+def get_test_results(job_id: int, db: Session = Depends(get_db)):
+    """Get all test results for a job."""
+    from ci_engine.server.models_extensions import TestRun
+
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    runs = db.query(TestRun).filter(TestRun.job_id == job_id).order_by(TestRun.id).all()
+    return {
+        "job_id": job_id,
+        "total": len(runs),
+        "results": [
+            {
+                "id": r.id,
+                "test_name": r.test_name,
+                "test_suite": r.test_suite,
+                "status": r.status,
+                "duration_ms": r.duration_ms,
+                "failure_message": r.failure_message,
+            }
+            for r in runs
+        ],
+    }
+
+
+@app.get("/api/repositories/{repository:path}/flakiness", tags=["test-results"])
+def get_flakiness(repository: str, db: Session = Depends(get_db)):
+    """Get flakiness records for a repository, sorted by score descending."""
+    from ci_engine.server.models_extensions import FlakynessRecord
+
+    records = (
+        db.query(FlakynessRecord)
+        .filter(FlakynessRecord.repository == repository)
+        .order_by(FlakynessRecord.flakiness_score.desc())
+        .all()
+    )
+    return {
+        "repository": repository,
+        "total": len(records),
+        "quarantined": sum(1 for r in records if r.quarantined),
+        "records": [
+            {
+                "id": r.id,
+                "test_suite": r.test_suite,
+                "test_name": r.test_name,
+                "total_runs": r.total_runs,
+                "failure_count": r.failure_count,
+                "pass_count": r.pass_count,
+                "flakiness_score": round(r.flakiness_score, 4),
+                "quarantined": r.quarantined,
+                "last_seen": r.last_seen.isoformat() if r.last_seen else None,
+            }
+            for r in records
+        ],
+    }
+
+
+# ===========================================================================
+# Feature 9 — Build analytics endpoints
+# ===========================================================================
+
+@app.get("/api/analytics/builds/{build_id}/critical-path", tags=["analytics"])
+def get_critical_path(build_id: int, db: Session = Depends(get_db)):
+    """Return the critical path through a build's job DAG."""
+    from ci_engine.core.analytics import compute_critical_path
+
+    build = db.query(Build).filter(Build.id == build_id).first()
+    if not build:
+        raise HTTPException(status_code=404, detail="Build not found")
+
+    path = compute_critical_path(db, build_id)
+    total_ms = sum(j["duration_ms"] for j in path)
+    return {
+        "build_id": build_id,
+        "critical_path": path,
+        "critical_path_duration_ms": total_ms,
+    }
+
+
+@app.get("/api/analytics/builds/{build_id}/metrics", tags=["analytics"])
+def get_build_metrics(build_id: int, db: Session = Depends(get_db)):
+    """Get materialized metrics for a specific build."""
+    from ci_engine.server.models_extensions import BuildMetrics
+
+    metrics = db.query(BuildMetrics).filter(BuildMetrics.build_id == build_id).first()
+    if not metrics:
+        raise HTTPException(status_code=404, detail="Metrics not yet available for this build")
+    return {
+        "build_id": metrics.build_id,
+        "repository": metrics.repository,
+        "branch": metrics.branch,
+        "status": metrics.status,
+        "queue_wait_ms": metrics.queue_wait_ms,
+        "total_duration_ms": metrics.total_duration_ms,
+        "job_count": metrics.job_count,
+        "failed_job_count": metrics.failed_job_count,
+        "agent_minutes_consumed": metrics.agent_minutes_consumed,
+        "is_flaky_build": metrics.is_flaky_build,
+        "created_at": metrics.created_at.isoformat() if metrics.created_at else None,
+    }
+
+
+@app.get("/api/analytics/repositories/{repository:path}/metrics", tags=["analytics"])
+def get_repository_metrics(
+    repository: str,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    """Get daily aggregate metrics for a repository.
+
+    Optional query params: ``start_date`` and ``end_date`` (YYYY-MM-DD).
+    """
+    from ci_engine.server.models_extensions import RepositoryMetrics
+
+    query = db.query(RepositoryMetrics).filter(RepositoryMetrics.repository == repository)
+    if start_date:
+        query = query.filter(RepositoryMetrics.date >= start_date)
+    if end_date:
+        query = query.filter(RepositoryMetrics.date <= end_date)
+    rows = query.order_by(RepositoryMetrics.date.desc()).all()
+
+    return {
+        "repository": repository,
+        "rows": [
+            {
+                "date": r.date,
+                "total_builds": r.total_builds,
+                "passed_builds": r.passed_builds,
+                "failed_builds": r.failed_builds,
+                "success_rate": round(r.passed_builds / r.total_builds, 4) if r.total_builds else None,
+                "avg_duration_ms": r.avg_duration_ms,
+                "p95_duration_ms": r.p95_duration_ms,
+                "total_agent_minutes": r.total_agent_minutes,
+                "mttr_ms": r.mttr_ms,
+            }
+            for r in rows
+        ],
+    }
+
+
+@app.get("/api/analytics/cost", tags=["analytics"])
+def get_cost_summary(
+    repository: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    """Summarize agent-minute consumption (proxy for compute cost).
+
+    Filter by ``repository``, ``start_date``, ``end_date`` (YYYY-MM-DD).
+    """
+    from ci_engine.server.models_extensions import BuildMetrics
+
+    query = db.query(BuildMetrics)
+    if repository:
+        query = query.filter(BuildMetrics.repository == repository)
+    if start_date:
+        query = query.filter(BuildMetrics.created_at >= start_date)
+    if end_date:
+        query = query.filter(BuildMetrics.created_at <= end_date)
+
+    rows = query.all()
+    total_agent_minutes = sum(r.agent_minutes_consumed or 0.0 for r in rows)
+    total_builds = len(rows)
+
+    return {
+        "repository": repository,
+        "start_date": start_date,
+        "end_date": end_date,
+        "total_builds": total_builds,
+        "total_agent_minutes": round(total_agent_minutes, 3),
+        "avg_agent_minutes_per_build": round(total_agent_minutes / total_builds, 3) if total_builds else 0.0,
+    }
+
+
+# ===========================================================================
+# Feature 8 — Environment approval gates
+# ===========================================================================
+
+@app.get("/api/environment-approvals/pending", tags=["environments"])
+def list_pending_approvals(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """List all pending environment approval requests."""
+    from ci_engine.server.models_extensions import EnvironmentApproval
+
+    pending = (
+        db.query(EnvironmentApproval)
+        .filter(EnvironmentApproval.status == "pending")
+        .order_by(EnvironmentApproval.requested_at.asc())
+        .all()
+    )
+    return {
+        "total": len(pending),
+        "approvals": [
+            {
+                "id": a.id,
+                "build_id": a.build_id,
+                "job_id": a.job_id,
+                "environment_name": a.environment_name,
+                "requested_at": a.requested_at.isoformat() if a.requested_at else None,
+                "expires_at": a.expires_at.isoformat() if a.expires_at else None,
+                "status": a.status,
+            }
+            for a in pending
+        ],
+    }
+
+
+class ApproveRequest(BaseModel):
+    approved_by: str
+    comment: Optional[str] = None
+
+
+class RejectRequest(BaseModel):
+    rejected_by: str
+    reason: Optional[str] = None
+
+
+@app.post("/api/environment-approvals/{approval_id}/approve", tags=["environments"])
+def approve_environment(
+    approval_id: int,
+    body: ApproveRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Approve an environment gate, unblocking the waiting job."""
+    from ci_engine.server.models_extensions import EnvironmentApproval
+
+    approval = db.query(EnvironmentApproval).filter(EnvironmentApproval.id == approval_id).first()
+    if not approval:
+        raise HTTPException(status_code=404, detail="Approval request not found")
+    if approval.status != "pending":
+        raise HTTPException(status_code=409, detail=f"Approval already in state: {approval.status}")
+
+    # Check expiry
+    if approval.expires_at and datetime.now(timezone.utc) > approval.expires_at.replace(tzinfo=timezone.utc):
+        approval.status = "expired"
+        db.commit()
+        raise HTTPException(status_code=410, detail="Approval request has expired")
+
+    approval.status = "approved"
+    approval.approved_at = datetime.now(timezone.utc)
+    approval.approved_by = body.approved_by
+
+    # Unblock the job
+    job = db.query(Job).filter(Job.id == approval.job_id).first()
+    if job and job.status == JobStatus.BLOCKED:
+        job.status = JobStatus.PENDING
+
+    db.commit()
+
+    if job:
+        broadcast_job_status(job.id, job.build_id, "pending")
+
+    return {"status": "approved", "approval_id": approval_id, "job_id": approval.job_id}
+
+
+@app.post("/api/environment-approvals/{approval_id}/reject", tags=["environments"])
+def reject_environment(
+    approval_id: int,
+    body: RejectRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Reject an environment gate, failing the waiting job."""
+    from ci_engine.server.models_extensions import EnvironmentApproval
+
+    approval = db.query(EnvironmentApproval).filter(EnvironmentApproval.id == approval_id).first()
+    if not approval:
+        raise HTTPException(status_code=404, detail="Approval request not found")
+    if approval.status != "pending":
+        raise HTTPException(status_code=409, detail=f"Approval already in state: {approval.status}")
+
+    approval.status = "rejected"
+    approval.rejected_at = datetime.now(timezone.utc)
+    approval.rejected_by = body.rejected_by
+    approval.rejection_reason = body.reason
+
+    # Fail the blocked job
+    job = db.query(Job).filter(Job.id == approval.job_id).first()
+    if job and job.status == JobStatus.BLOCKED:
+        job.status = JobStatus.FAILED
+        job.finished_at = datetime.now(timezone.utc)
+        job.exit_code = -1
+
+    db.commit()
+
+    if job:
+        broadcast_job_status(job.id, job.build_id, "failed")
+        from ci_engine.core.scheduler import Scheduler
+        Scheduler.check_and_update_dependencies(db, job.build_id)
+
+    return {"status": "rejected", "approval_id": approval_id, "job_id": approval.job_id}
+
+
+@app.get("/api/environment-approvals/{approval_id}", tags=["environments"])
+def get_approval(approval_id: int, db: Session = Depends(get_db)):
+    """Get a specific environment approval request."""
+    from ci_engine.server.models_extensions import EnvironmentApproval
+
+    approval = db.query(EnvironmentApproval).filter(EnvironmentApproval.id == approval_id).first()
+    if not approval:
+        raise HTTPException(status_code=404, detail="Approval request not found")
+    return {
+        "id": approval.id,
+        "build_id": approval.build_id,
+        "job_id": approval.job_id,
+        "environment_name": approval.environment_name,
+        "requested_at": approval.requested_at.isoformat() if approval.requested_at else None,
+        "approved_at": approval.approved_at.isoformat() if approval.approved_at else None,
+        "approved_by": approval.approved_by,
+        "rejected_at": approval.rejected_at.isoformat() if approval.rejected_at else None,
+        "rejected_by": approval.rejected_by,
+        "rejection_reason": approval.rejection_reason,
+        "status": approval.status,
+        "expires_at": approval.expires_at.isoformat() if approval.expires_at else None,
+    }
+
+
+# ===========================================================================
+# Feature 10 — Agent token revocation
+# ===========================================================================
+
+@app.post("/api/agents/{agent_id}/revoke-token", tags=["agents"])
+def revoke_agent_token(
+    agent_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Revoke all active tokens for an agent (admin only)."""
+    from ci_engine.server.models_extensions import AgentToken
+
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Requires admin permission")
+
+    agent = db.query(Agent).filter(Agent.id == agent_id).first()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    tokens = (
+        db.query(AgentToken)
+        .filter(AgentToken.agent_id == agent_id, AgentToken.revoked == False)  # noqa: E712
+        .all()
+    )
+    count = len(tokens)
+    for t in tokens:
+        t.revoked = True
+    db.commit()
+
+    return {"status": "revoked", "agent_id": agent_id, "tokens_revoked": count}
+
+
+# ===========================================================================
+# Build Annotations  (Buildkite: buildkite-agent annotate)
+# ===========================================================================
+
+@app.post("/api/builds/{build_id}/annotations", response_model=BuildAnnotationResponse, tags=["builds"])
+def upsert_build_annotation(
+    build_id: int,
+    body: BuildAnnotationCreate,
+    db: Session = Depends(get_db),
+):
+    """Create or update a build annotation (upserted by context key)."""
+    build = db.query(Build).filter(Build.id == build_id).first()
+    if not build:
+        raise HTTPException(status_code=404, detail="Build not found")
+
+    now = datetime.now(timezone.utc)
+    existing = (
+        db.query(BuildAnnotation)
+        .filter(BuildAnnotation.build_id == build_id, BuildAnnotation.context == body.context)
+        .first()
+    )
+    if existing:
+        existing.body_html = body.body_html
+        existing.style = body.style
+        existing.updated_at = now
+        if body.created_by_job_id is not None:
+            existing.created_by_job_id = body.created_by_job_id
+        db.commit()
+        db.refresh(existing)
+        return existing
+    else:
+        annotation = BuildAnnotation(
+            build_id=build_id,
+            context=body.context,
+            body_html=body.body_html,
+            style=body.style,
+            created_by_job_id=body.created_by_job_id,
+            created_at=now,
+        )
+        db.add(annotation)
+        db.commit()
+        db.refresh(annotation)
+        return annotation
+
+
+@app.get("/api/builds/{build_id}/annotations", tags=["builds"])
+def get_build_annotations(build_id: int, db: Session = Depends(get_db)):
+    """Get all annotations for a build, ordered by creation time."""
+    build = db.query(Build).filter(Build.id == build_id).first()
+    if not build:
+        raise HTTPException(status_code=404, detail="Build not found")
+
+    annotations = (
+        db.query(BuildAnnotation)
+        .filter(BuildAnnotation.build_id == build_id)
+        .order_by(BuildAnnotation.created_at.asc())
+        .all()
+    )
+    return {
+        "build_id": build_id,
+        "total": len(annotations),
+        "annotations": [
+            {
+                "id": a.id,
+                "context": a.context,
+                "body_html": a.body_html,
+                "style": a.style,
+                "created_by_job_id": a.created_by_job_id,
+                "created_at": a.created_at.isoformat() if a.created_at else None,
+                "updated_at": a.updated_at.isoformat() if a.updated_at else None,
+            }
+            for a in annotations
+        ],
+    }
+
+
+@app.delete("/api/builds/{build_id}/annotations/{context}", tags=["builds"])
+def delete_build_annotation(
+    build_id: int,
+    context: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Delete a specific build annotation by context."""
+    annotation = (
+        db.query(BuildAnnotation)
+        .filter(BuildAnnotation.build_id == build_id, BuildAnnotation.context == context)
+        .first()
+    )
+    if not annotation:
+        raise HTTPException(status_code=404, detail="Annotation not found")
+    db.delete(annotation)
+    db.commit()
+    return {"status": "deleted", "context": context}
+
+
+# ===========================================================================
+# Build Metadata KV  (Buildkite: buildkite-agent meta-data set/get)
+# ===========================================================================
+
+@app.post("/api/builds/{build_id}/metadata/{key}", response_model=BuildMetadataResponse, tags=["builds"])
+def set_build_metadata(
+    build_id: int,
+    key: str,
+    body: BuildMetadataSet,
+    db: Session = Depends(get_db),
+):
+    """Set (upsert) a metadata key-value pair on a build."""
+    build = db.query(Build).filter(Build.id == build_id).first()
+    if not build:
+        raise HTTPException(status_code=404, detail="Build not found")
+
+    now = datetime.now(timezone.utc)
+    existing = (
+        db.query(BuildMetadata)
+        .filter(BuildMetadata.build_id == build_id, BuildMetadata.key == key)
+        .first()
+    )
+    if existing:
+        existing.value = body.value
+        existing.updated_at = now
+        if body.set_by_job_id is not None:
+            existing.set_by_job_id = body.set_by_job_id
+        db.commit()
+        db.refresh(existing)
+        return existing
+    else:
+        meta = BuildMetadata(
+            build_id=build_id,
+            key=key,
+            value=body.value,
+            set_by_job_id=body.set_by_job_id,
+            created_at=now,
+        )
+        db.add(meta)
+        db.commit()
+        db.refresh(meta)
+        return meta
+
+
+@app.get("/api/builds/{build_id}/metadata/{key}", tags=["builds"])
+def get_build_metadata_key(build_id: int, key: str, db: Session = Depends(get_db)):
+    """Get a specific metadata value by key. Returns 404 if not set."""
+    meta = (
+        db.query(BuildMetadata)
+        .filter(BuildMetadata.build_id == build_id, BuildMetadata.key == key)
+        .first()
+    )
+    if not meta:
+        raise HTTPException(status_code=404, detail=f"Metadata key '{key}' not found")
+    return {"build_id": build_id, "key": meta.key, "value": meta.value}
+
+
+@app.get("/api/builds/{build_id}/metadata", tags=["builds"])
+def list_build_metadata(build_id: int, db: Session = Depends(get_db)):
+    """List all metadata key-value pairs for a build."""
+    build = db.query(Build).filter(Build.id == build_id).first()
+    if not build:
+        raise HTTPException(status_code=404, detail="Build not found")
+
+    rows = (
+        db.query(BuildMetadata)
+        .filter(BuildMetadata.build_id == build_id)
+        .order_by(BuildMetadata.key.asc())
+        .all()
+    )
+    return {
+        "build_id": build_id,
+        "metadata": {r.key: r.value for r in rows},
+    }
+
+
+# ===========================================================================
+# Dynamic Pipeline Upload  (Buildkite: buildkite-agent pipeline upload)
+# ===========================================================================
+
+class PipelineUploadRequest(BaseModel):
+    pipeline_yaml: str
+
+
+@app.post("/api/builds/{build_id}/pipeline-upload", tags=["builds"])
+def pipeline_upload(
+    build_id: int,
+    body: PipelineUploadRequest,
+    db: Session = Depends(get_db),
+):
+    """Append new steps to a running build (dynamic pipeline generation).
+
+    Equivalent to ``buildkite-agent pipeline upload``.  The uploaded YAML is
+    parsed exactly like the original pipeline; new jobs are appended with
+    step indexes continuing from the last existing job.
+    """
+    import json as _json
+    from ci_engine.core.scheduler import Scheduler
+
+    build = db.query(Build).filter(Build.id == build_id).first()
+    if not build:
+        raise HTTPException(status_code=404, detail="Build not found")
+
+    if build.status not in (BuildStatus.PENDING, BuildStatus.RUNNING):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot upload pipeline to a build in state '{build.status.value}'",
+        )
+
+    steps = parse_pipeline(body.pipeline_yaml)
+    if not steps:
+        raise HTTPException(status_code=422, detail="No steps parsed from uploaded pipeline YAML")
+
+    # Continue step indexes from where the build left off
+    existing_max = db.query(Job).filter(Job.build_id == build_id).count()
+    new_jobs = []
+
+    for i, step in enumerate(steps):
+        env_vars = step.get("env")
+        if isinstance(env_vars, dict):
+            env_vars = _json.dumps(env_vars) if env_vars else None
+        elif isinstance(env_vars, list):
+            from ci_engine.core.pipeline import _list_env_to_dict  # type: ignore[attr-defined]
+            env_vars = _json.dumps(_list_env_to_dict(env_vars)) or None
+        else:
+            env_vars = None
+
+        depends_on = step.get("depends_on") or []
+        if isinstance(depends_on, list):
+            depends_on_str = ",".join(str(d) for d in depends_on) or None
+        else:
+            depends_on_str = str(depends_on) or None
+
+        node_type = step.get("node_type") or step.get("step_type") or "command"
+        if node_type in ("block", "manual", "approval", "gate"):
+            node_type = "wait"
+
+        coe = bool(step.get("continue_on_error") or step.get("continue-on-error", False))
+        skip_condition = step.get("skip_condition")
+        timeout_secs = step.get("timeout") or step.get("timeout_seconds") or 3600
+        command = step.get("command") or ("" if node_type in ("wait", "block") else "echo done")
+
+        job_status = (
+            JobStatus.SKIPPED if skip_condition
+            else JobStatus.BLOCKED if node_type in ("wait", "block")
+            else JobStatus.PENDING
+        )
+
+        job = Job(
+            build_id=build_id,
+            step_index=existing_max + i,
+            label=step.get("label", f"Dynamic Step {i + 1}"),
+            command=command,
+            status=job_status,
+            env_vars=env_vars,
+            working_dir=step.get("working_directory"),
+            timeout_seconds=int(timeout_secs),
+            max_retries=int(step.get("retry", 0)),
+            priority=int(step.get("priority", 0)),
+            required_tags=step.get("required_tags"),
+            required_skills=step.get("required_skills"),
+            matrix_vars=_json.dumps(step.get("matrix_vars")) if step.get("matrix_vars") else None,
+            skip_condition=skip_condition,
+            depends_on=depends_on_str,
+            node_type=node_type,
+            continue_on_error=coe,
+            soft_fail=bool(step.get("soft_fail", False)),
+            concurrency=step.get("concurrency"),
+            concurrency_group=step.get("concurrency_group"),
+            parallel_group_id=step.get("parallel_group_id"),
+            parallel_index=step.get("parallel_index"),
+            parallel_total=step.get("parallel_total"),
+            queue=step.get("queue", "default"),
+        )
+        db.add(job)
+        new_jobs.append(job)
+
+    db.commit()
+
+    # Trigger dependency re-evaluation so any immediately-runnable jobs unblock
+    Scheduler.check_and_update_dependencies(db, build_id)
+
+    # Broadcast updated build state
+    broadcast_build_status(build_id, build.status.value, existing_max + len(new_jobs), 0, 0, 0)
+
+    return {
+        "status": "uploaded",
+        "build_id": build_id,
+        "jobs_added": len(new_jobs),
+        "job_ids": [j.id for j in new_jobs],
+    }
