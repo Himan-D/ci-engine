@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: MIT
 # CI Engine - Agent Plugin System
 
-import time
-from abc import ABC, abstractmethod
+from abc import ABC
 from dataclasses import dataclass, field, asdict
 from typing import Optional, Any
 from datetime import datetime, timezone
@@ -139,6 +138,50 @@ class AgentPlugin(ABC):
         """Called when plugin is unregistered from an agent."""
         self._agent = None
 
+    # ------------------------------------------------------------------
+    # Checkout lifecycle hooks (Buildkite-style)
+    # ------------------------------------------------------------------
+
+    def pre_checkout(self, context: JobContext) -> JobContext:
+        """Called before the workspace checkout / git clone.
+
+        Use this hook to inject credentials, set git config, or skip checkout.
+        Return the (possibly modified) context.
+        """
+        return context
+
+    def post_checkout(self, context: JobContext) -> JobContext:
+        """Called after the workspace has been checked out.
+
+        Use this hook to install dependencies, set up caches, or validate
+        the checked-out state before the command runs.
+        """
+        return context
+
+    # ------------------------------------------------------------------
+    # Command lifecycle hooks (Buildkite-style)
+    # ------------------------------------------------------------------
+
+    def pre_command(self, context: JobContext) -> JobContext:
+        """Called immediately before the step command is executed.
+
+        Use this hook to inject env vars, export secrets, or modify the
+        command string at the last moment.
+        """
+        return context
+
+    def post_command(self, context: JobContext, result: JobResult) -> JobResult:
+        """Called immediately after the step command finishes (before artifacts).
+
+        Use this hook to parse output, collect metrics, or post annotations
+        before the job is marked complete.
+        """
+        return result
+
+    # ------------------------------------------------------------------
+    # Core execute hooks
+    # ------------------------------------------------------------------
+
     def pre_execute(self, context: JobContext) -> JobContext:
         """Called before job execution.
 
@@ -269,6 +312,46 @@ class HookDispatcher:
     def add_plugin(self, plugin: AgentPlugin) -> None:
         """Add a plugin to this dispatcher."""
         self._plugins.append(plugin)
+
+    def dispatch_pre_checkout(self, context: JobContext) -> JobContext:
+        """Dispatch pre_checkout hooks to all plugins."""
+        for plugin in self._plugins:
+            if plugin.enabled:
+                try:
+                    context = plugin.pre_checkout(context)
+                except Exception as exc:
+                    plugin.on_error(context, exc)
+        return context
+
+    def dispatch_post_checkout(self, context: JobContext) -> JobContext:
+        """Dispatch post_checkout hooks to all plugins."""
+        for plugin in self._plugins:
+            if plugin.enabled:
+                try:
+                    context = plugin.post_checkout(context)
+                except Exception as exc:
+                    plugin.on_error(context, exc)
+        return context
+
+    def dispatch_pre_command(self, context: JobContext) -> JobContext:
+        """Dispatch pre_command hooks to all plugins."""
+        for plugin in self._plugins:
+            if plugin.enabled:
+                try:
+                    context = plugin.pre_command(context)
+                except Exception as exc:
+                    plugin.on_error(context, exc)
+        return context
+
+    def dispatch_post_command(self, context: JobContext, result: JobResult) -> JobResult:
+        """Dispatch post_command hooks to all plugins."""
+        for plugin in self._plugins:
+            if plugin.enabled:
+                try:
+                    result = plugin.post_command(context, result)
+                except Exception as exc:
+                    plugin.on_error(context, exc)
+        return result
 
     def dispatch_pre_execute(self, context: JobContext) -> JobContext:
         """Dispatch pre_execute hooks to all plugins."""

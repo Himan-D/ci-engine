@@ -45,7 +45,7 @@ steps:
 """
         result = parse_pipeline(pipeline)
         assert len(result) == 1
-        assert result[0]["env"] == ["DEBUG=true", "VERSION=1.0"]
+        assert result[0]["env"] == {"DEBUG": "true", "VERSION": "1.0"}
 
     def test_parse_pipeline_with_skip(self):
         """Test parsing pipeline with skip flag."""

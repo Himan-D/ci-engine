@@ -7,7 +7,6 @@ import bcrypt
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import Depends, HTTPException, status
 from sqlalchemy import Column, Integer, String, DateTime, Boolean
 from pydantic import BaseModel, ConfigDict
 
@@ -315,6 +314,55 @@ class Permission:
         elif permission == Permission.VIEWER:
             return role in (Permission.ADMIN, Permission.DEVELOPER, Permission.VIEWER)
         return False
+
+
+# ---------------------------------------------------------------------------
+# Agent token helpers
+# ---------------------------------------------------------------------------
+
+def issue_agent_token(db, agent_id: int) -> str:
+    """Create a scoped AgentToken for *agent_id* and return the raw token.
+
+    The raw token is returned ONCE and never stored; only the SHA-256 hash
+    is persisted (same pattern as ``ApiToken``).
+    """
+    import json as _json
+    from ci_engine.server.models_extensions import AgentToken, AGENT_ALLOWED_ENDPOINTS
+
+    raw = generate_api_token()
+    token_hash = hash_api_token(raw)
+
+    record = AgentToken(
+        agent_id=agent_id,
+        token_hash=token_hash,
+        allowed_endpoints=_json.dumps(AGENT_ALLOWED_ENDPOINTS),
+    )
+    db.add(record)
+    db.commit()
+    return raw
+
+
+def verify_agent_token(db, raw_token: str):
+    """Return the ``AgentToken`` record if valid, else None."""
+    from ci_engine.server.models_extensions import AgentToken
+    from datetime import datetime, timezone
+
+    token_hash = hash_api_token(raw_token)
+    record = (
+        db.query(AgentToken)
+        .filter(
+            AgentToken.token_hash == token_hash,
+            AgentToken.revoked == False,  # noqa: E712
+        )
+        .first()
+    )
+    if record is None:
+        return None
+    if record.expires_at and record.expires_at < datetime.now(timezone.utc):
+        return None
+    record.last_used = datetime.now(timezone.utc)
+    db.commit()
+    return record
 
 
 class RequirePermission:

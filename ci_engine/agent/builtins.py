@@ -19,8 +19,7 @@ Example usage:
 """
 
 import time
-import json
-from typing import Optional, Any
+from typing import Optional
 from dataclasses import dataclass
 
 from ci_engine.agent.plugins import AgentPlugin, JobContext, JobResult

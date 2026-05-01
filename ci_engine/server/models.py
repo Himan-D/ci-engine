@@ -4,7 +4,7 @@
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional, Any
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 from sqlalchemy import Column, Integer, String, DateTime, Text, ForeignKey, Enum as SQLEnum, Boolean
 from sqlalchemy.orm import declarative_base, relationship
 
@@ -25,6 +25,7 @@ class JobStatus(str, Enum):
     RUNNING = "running"
     PASSED = "passed"
     FAILED = "failed"
+    SOFT_FAILED = "soft_failed"
     CANCELED = "canceled"
     BLOCKED = "blocked"
     SKIPPED = "skipped"
@@ -47,6 +48,7 @@ class Build(Base):
     git_ref = Column(String(100), nullable=True)
     clone_depth = Column(Integer, nullable=True)
     status = Column(SQLEnum(BuildStatus), default=BuildStatus.PENDING)
+    pr_number = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)
@@ -76,6 +78,15 @@ class Job(Base):
     skip_condition = Column(String(500), nullable=True)
     required_skills = Column(String(500), nullable=True)
     depends_on = Column(String(500), nullable=True)
+    node_type = Column(String(50), nullable=True, default="command")  # command, wait, block, parallel, matrix
+    continue_on_error = Column(Boolean, default=False)
+    soft_fail = Column(Boolean, default=False)
+    concurrency = Column(Integer, nullable=True)
+    concurrency_group = Column(String(200), nullable=True)
+    parallel_group_id = Column(String(100), nullable=True)
+    parallel_index = Column(Integer, nullable=True)
+    parallel_total = Column(Integer, nullable=True)
+    queue = Column(String(100), default="default")
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)
@@ -98,6 +109,7 @@ class Agent(Base):
     pool_id = Column(Integer, ForeignKey("agent_pools.id"), nullable=True)
     version = Column(String(50), nullable=True)
     drain_mode = Column(Boolean, default=False)
+    queue = Column(String(100), default="default")
     registered_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     last_seen = Column(DateTime, nullable=True)
 
@@ -174,6 +186,65 @@ class JobLog(Base):
     job = relationship("Job", back_populates="logs")
 
 
+class EnvironmentGroup(Base):
+    __tablename__ = "environment_groups"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(100), nullable=False, unique=True)
+    description = Column(Text, nullable=True)
+    variables = Column(Text, nullable=True)  # JSON string
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, nullable=True)
+
+
+class PipelineTrigger(Base):
+    __tablename__ = "pipeline_triggers"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(100), nullable=False)
+    pipeline = Column(String(500), nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+class BuildAnnotation(Base):
+    """Styled HTML annotation posted by a job to the build page.
+
+    Multiple annotations can exist per build; each is keyed by *context*
+    (e.g. "coverage", "lint", "security"). Upsert by (build_id, context).
+    """
+
+    __tablename__ = "build_annotations"
+
+    id = Column(Integer, primary_key=True)
+    build_id = Column(Integer, ForeignKey("builds.id"), nullable=False, index=True)
+    # Unique key per build — upsert replaces when context matches
+    context = Column(String(100), nullable=False)
+    body_html = Column(Text, nullable=False)
+    # success / warning / error / info
+    style = Column(String(20), default="info")
+    created_by_job_id = Column(Integer, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, nullable=True)
+
+
+class BuildMetadata(Base):
+    """Arbitrary key-value pairs set by agents during a build.
+
+    Equivalent to Buildkite's ``buildkite-agent meta-data set KEY VALUE``.
+    Keys are unique per build; setting an existing key overwrites it.
+    """
+
+    __tablename__ = "build_metadata"
+
+    id = Column(Integer, primary_key=True)
+    build_id = Column(Integer, ForeignKey("builds.id"), nullable=False, index=True)
+    key = Column(String(200), nullable=False)
+    value = Column(Text, nullable=False)
+    set_by_job_id = Column(Integer, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, nullable=True)
+
+
 # Pydantic models for API
 class BuildCreate(BaseModel):
     pipeline: str
@@ -217,11 +288,28 @@ class JobResponse(BaseModel):
     working_dir: Optional[str]
     matrix_vars: Optional[dict[str, Any]] = {}
     skip_condition: Optional[str]
+    node_type: Optional[str] = "command"
+    continue_on_error: bool = False
     created_at: datetime
     started_at: Optional[datetime]
     finished_at: Optional[datetime]
 
     model_config = ConfigDict(from_attributes=True)
+
+    @field_validator("env_vars", "matrix_vars", mode="before")
+    @classmethod
+    def parse_json_field(cls, v: Any) -> Any:
+        if v is None:
+            return {}
+        if isinstance(v, (dict, list)):
+            return v
+        if isinstance(v, str):
+            import json
+            try:
+                return json.loads(v)
+            except Exception:
+                return {}
+        return {}
 
 
 class AgentCreate(BaseModel):
@@ -238,14 +326,26 @@ class AgentResponse(BaseModel):
     hostname: str
     ip_address: str
     status: AgentStatus
-    tags: Optional[list[str]]
+    tags: Optional[list[str]] = []
     skills: Optional[list[str]] = []
     pool_id: Optional[int] = None
     drain_mode: bool = False
     registered_at: datetime
-    last_seen: Optional[datetime]
+    last_seen: Optional[datetime] = None
 
     model_config = ConfigDict(from_attributes=True)
+
+    @field_validator("tags", "skills", mode="before")
+    @classmethod
+    def csv_to_list(cls, v: Any) -> list[str]:
+        """Convert comma-separated string stored in DB to a list."""
+        if v is None:
+            return []
+        if isinstance(v, list):
+            return v
+        if isinstance(v, str):
+            return [s.strip() for s in v.split(",") if s.strip()]
+        return []
 
 
 class AgentPoolCreate(BaseModel):
@@ -381,6 +481,36 @@ class SkillCategoryResponse(BaseModel):
     skill_count: int
 
 
+class EnvironmentGroupCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+    variables: Optional[dict] = None
+
+
+class EnvironmentGroupResponse(BaseModel):
+    id: int
+    name: str
+    description: Optional[str] = None
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class PipelineTriggerCreate(BaseModel):
+    name: str
+    pipeline: str
+
+
+class PipelineTriggerResponse(BaseModel):
+    id: int
+    name: str
+    pipeline: str
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 # Pydantic models for artifacts
 class ArtifactResponse(BaseModel):
     id: int
@@ -392,6 +522,47 @@ class ArtifactResponse(BaseModel):
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+
+# ---- BuildAnnotation Pydantic models ----
+
+class BuildAnnotationCreate(BaseModel):
+    context: str = "default"
+    body_html: str
+    style: str = "info"  # success / warning / error / info
+    created_by_job_id: Optional[int] = None
+
+
+class BuildAnnotationResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    build_id: int
+    context: str
+    body_html: str
+    style: str
+    created_by_job_id: Optional[int] = None
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+
+
+# ---- BuildMetadata Pydantic models ----
+
+class BuildMetadataSet(BaseModel):
+    value: str
+    set_by_job_id: Optional[int] = None
+
+
+class BuildMetadataResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    build_id: int
+    key: str
+    value: str
+    set_by_job_id: Optional[int] = None
+    created_at: datetime
+    updated_at: Optional[datetime] = None
 
 
 # Update forward references

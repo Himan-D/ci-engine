@@ -6,7 +6,6 @@ import re
 import json
 import os
 import time
-import hashlib
 import threading
 from pathlib import Path
 from typing import Optional
@@ -14,7 +13,7 @@ from dataclasses import dataclass, field, asdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 
-from ci_engine.core.skills import SKILL_DEFINITIONS, get_skill_by_name, SKILL_CATEGORIES
+from ci_engine.core.skills import SKILL_DEFINITIONS, SKILL_CATEGORIES
 
 
 SKILL_CACHE_DIR = Path(os.path.expanduser("~/.ci-engine"))
@@ -131,7 +130,6 @@ class SkillDetector:
             }
 
             for future in as_completed(futures):
-                skill_name = futures[future]
                 try:
                     result = future.result()
                     if result and result.installed:
@@ -543,7 +541,6 @@ class CustomSkillManager:
 def auto_detect_skills(force: bool = False) -> dict:
     """Convenience function to auto-detect skills."""
     detector = SkillDetector(use_cache=True)
-    skills = detector.detect_all(force=force)
     return {
         "skills": detector.to_agent_skills(),
         "summary": detector.get_summary(),

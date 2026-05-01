@@ -6,7 +6,7 @@ import sys
 import os
 import json
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any
 from functools import wraps
 
 

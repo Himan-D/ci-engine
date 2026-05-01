@@ -6,6 +6,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from ci_engine.server.models import Base
+import ci_engine.server.models_ai  # noqa: F401 — registers AI tables with Base
 
 
 @pytest.fixture(scope="session")

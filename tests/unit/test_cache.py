@@ -2,9 +2,6 @@
 # CI Engine - Unit tests for cache module
 
 import pytest
-import tempfile
-import os
-from unittest.mock import MagicMock, patch
 from ci_engine.core.cache import (
     LocalCache,
     RemoteCache,

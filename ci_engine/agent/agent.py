@@ -68,6 +68,7 @@ class Agent:
         self._job_queue: queue.Queue[int] = queue.Queue()
         self._executor: ThreadPoolExecutor | None = None
         self._running_jobs: dict[int, RunningJob] = {}
+        self._job_pids: dict[int, int] = {}  # job_id → subprocess PID for resource monitor
         self._lock = threading.Lock()
         self._resource_monitor_running = False
 
@@ -142,16 +143,13 @@ class Agent:
         """Poll for available jobs."""
         try:
             response = requests.get(
-                f"{self.server_url}/api/builds",
-                params={"status": "pending"},
+                f"{self.server_url}/api/jobs/pending",
                 timeout=10,
             )
             if response.status_code == 200:
-                builds = response.json()
-                for build in builds:
-                    for job in build.get("jobs", []):
-                        if job.get("status") == "pending":
-                            return job
+                jobs = response.json()
+                if jobs:
+                    return jobs[0]
         except requests.RequestException as e:
             print(f"Failed to poll for jobs: {e}")
         return None
@@ -205,13 +203,12 @@ class Agent:
         return False
 
     def execute_job(self, job: dict) -> int:
-        """Execute a job and return exit code.
+        """Execute a job with real-time log streaming.
 
-        Uses Executor class for proper isolation, timeout handling, and container support.
-        Also processes through plugin system if plugins are configured.
+        Streams stdout/stderr line-by-line to the server WebSocket and HTTP
+        log endpoint as the process runs — no buffering until completion.
         """
         import os as os_module
-        import subprocess
         from datetime import datetime, timezone
 
         print(f"Executing job #{job['id']}: {job['label']}")
@@ -222,18 +219,16 @@ class Agent:
         container_image = job.get("container_image")
         timeout_seconds = job.get("timeout_seconds", 3600)
 
-        # Create job context for plugins
+        # Plugin system
         from ci_engine.agent.plugins import JobContext, JobResult, HookDispatcher
 
         context = JobContext.from_job(job)
         context.agent_name = self.name
         context.agent_id = self.agent_id
 
-        # Process through middleware if available
         if self._middleware:
             job = self._middleware.process_pre(job)
 
-        # Process through plugin pre_execute hooks
         dispatcher = HookDispatcher(self._plugins)
         context = dispatcher.dispatch_pre_execute(context)
         job["command"] = context.command
@@ -244,24 +239,44 @@ class Agent:
         container_image = context.container_image
         timeout_seconds = context.timeout_seconds
 
+        # pre_checkout hook — fired before workspace is set up / git clone
+        context = dispatcher.dispatch_pre_checkout(context)
+
         if self.use_websocket:
             self.connect_websocket(job_id)
 
         start_time = datetime.now(timezone.utc)
         exit_code = -1
-        stdout = ""
-        stderr = ""
+
+        def send_line(stream: str, line: str):
+            """Send a single log line via WS + HTTP fallback."""
+            if not self.send_log_ws(job_id, stream, line):
+                self._send_log(job_id, stream, line)
+            else:
+                # Also persist to DB via HTTP so logs survive WS disconnect
+                self._send_log(job_id, stream, line)
 
         try:
-            # Clone repository if build has repository info
+            # Per-build isolated workspace so concurrent builds don't clobber each other
             build_info = job.get("build", {})
             repository = build_info.get("repository") if build_info else None
-            workspace_dir = os_module.environ.get("CI_WORKSPACE", "/tmp/ci-engine-workspace")
+            build_id = job.get("build_id", 0)
+            base_workspace = os_module.environ.get("CI_WORKSPACE", "/tmp/ci-engine-workspace")
+            workspace_dir = os_module.path.join(base_workspace, f"build-{build_id}")
+            os_module.makedirs(workspace_dir, exist_ok=True)
 
-            if repository:
+            # Only clone if the repository is a real URL (not a label like "org/repo")
+            is_clonable = repository and (
+                repository.startswith("http://")
+                or repository.startswith("https://")
+                or repository.startswith("git@")
+                or repository.startswith("ssh://")
+                or repository.startswith("git://")
+            )
+            if is_clonable:
                 from ci_engine.agent.git import clone_repository, GitCloneError
 
-                print(f"Cloning repository: {repository}")
+                send_line("stdout", f"==> Cloning {repository}")
                 branch = build_info.get("branch", "main")
                 commit = build_info.get("commit")
                 ref = commit or branch or "main"
@@ -274,26 +289,42 @@ class Agent:
                         ref=ref,
                         depth=depth,
                     )
-                    print(f"Repository cloned: {ref}")
+                    send_line("stdout", f"==> Cloned {ref}")
                 except GitCloneError as e:
-                    error_msg = f"Failed to clone repository: {e}"
-                    print(error_msg)
-                    self.send_log_ws(job_id, "stderr", error_msg)
+                    send_line("stderr", f"Clone failed: {e}")
                     return 1
                 except FileNotFoundError:
-                    error_msg = "Git not installed on agent"
-                    print(error_msg)
-                    self.send_log_ws(job_id, "stderr", error_msg)
+                    send_line("stderr", "Git not installed on agent")
                     return 1
 
+            # post_checkout hook — fired after workspace / git clone is ready
+            context = dispatcher.dispatch_post_checkout(context)
+
+            # pre_command hook — last chance to modify command/env before execution
+            context = dispatcher.dispatch_pre_command(context)
+            command = context.command  # allow hooks to rewrite the command
+
+            # Build env: merge job env_vars over process environment
+            env_vars: dict[str, str] = {}
+            raw_env = job.get("env_vars") or {}
+            if isinstance(raw_env, str):
+                try:
+                    raw_env = json.loads(raw_env)
+                except Exception:
+                    raw_env = {}
+            if isinstance(raw_env, dict):
+                env_vars.update({str(k): str(v) for k, v in raw_env.items()})
+
+            # Inject standard CI environment variables
+            env_vars.setdefault("CI", "true")
+            env_vars.setdefault("CI_ENGINE", "true")
+            env_vars.setdefault("BUILD_ID", str(job.get("build_id", "")))
+            env_vars.setdefault("JOB_ID", str(job_id))
+            env_vars.setdefault("JOB_LABEL", job.get("label", ""))
+
             if container_image:
-                print(f"Running in container: {container_image}")
+                send_line("stdout", f"==> Running in container: {container_image}")
                 from ci_engine.core.container import execute_in_container
-
-                workspace_dir = os_module.environ.get("CI_WORKSPACE", "/tmp/ci-engine-workspace")
-                os_module.makedirs(workspace_dir, exist_ok=True)
-
-                env_vars = context.env_vars or {}
 
                 result = execute_in_container(
                     image=container_image,
@@ -304,56 +335,48 @@ class Agent:
                     build_id=job.get("build_id", 0),
                 )
                 exit_code = result.exit_code
-                stdout = result.stdout
-                stderr = result.stderr
+                # Container output arrives all at once — stream line by line
+                for line in result.stdout.splitlines():
+                    send_line("stdout", line)
+                for line in result.stderr.splitlines():
+                    send_line("stderr", line)
             else:
                 from ci_engine.core.executor import Executor
 
-                executor = Executor(
-                    workspace=os_module.environ.get("CI_WORKSPACE", "/tmp/ci-engine-workspace")
-                )
+                executor = Executor(workspace=workspace_dir)
 
-                env_vars = context.env_vars or {}
+                send_line("stdout", f"$ {command}")
 
-                exit_code, stdout, stderr = executor.execute(
+                # Real-time streaming via generator
+                gen = executor.execute_streaming(
                     command=command,
                     env=env_vars if env_vars else None,
                     timeout=timeout_seconds,
                 )
-
-            if stdout:
-                if not self.send_log_ws(job_id, "stdout", stdout):
-                    self._send_log(job_id, "stdout", stdout)
-            if stderr:
-                if not self.send_log_ws(job_id, "stderr", stderr):
-                    self._send_log(job_id, "stderr", stderr)
+                try:
+                    while True:
+                        stream, line = next(gen)
+                        send_line(stream, line)
+                        # Periodically check for cancellation
+                        if self._check_job_cancelled(job_id):
+                            send_line("stderr", "Job cancelled")
+                            exit_code = -1
+                            break
+                except StopIteration as e:
+                    exit_code = e.value if e.value is not None else -1
 
             return exit_code
 
-        except subprocess.TimeoutExpired:
-            self.send_log_ws(job_id, "stderr", f"Job timed out after {timeout_seconds}s")
-            self._send_log(job_id, "stderr", f"Job timed out after {timeout_seconds}s")
-            exit_code = -1
-            stderr = f"Job timed out after {timeout_seconds}s"
-        except ValueError as e:
-            error_msg = f"Invalid command syntax: {e}"
-            self.send_log_ws(job_id, "stderr", error_msg)
-            self._send_log(job_id, "stderr", error_msg)
-            exit_code = -1
-            stderr = error_msg
         except Exception as e:
-            error_msg = str(e)
-            self.send_log_ws(job_id, "stderr", error_msg)
-            self._send_log(job_id, "stderr", error_msg)
+            send_line("stderr", f"Agent error: {e}")
             exit_code = -1
-            stderr = error_msg
+            return exit_code
         finally:
-            # Process through plugin post_execute hooks
             duration_ms = int((datetime.now(timezone.utc) - start_time).total_seconds() * 1000)
-            result = JobResult.from_result(
-                exit_code, stdout, stderr, timeout_seconds > 0, duration_ms
-            )
-            result = dispatcher.dispatch_post_execute(context, result)
+            result_obj = JobResult.from_result(exit_code, "", "", timeout_seconds > 0, duration_ms)
+            # post_command fires immediately after command, before post_execute plugins
+            result_obj = dispatcher.dispatch_post_command(context, result_obj)
+            dispatcher.dispatch_post_execute(context, result_obj)
 
             if self.ws:
                 try:
@@ -362,29 +385,27 @@ class Agent:
                     pass
                 self.ws = None
 
-        return exit_code
-
     def _send_log(self, job_id: int, stream: str, line: str):
-        """Send log line to server via HTTP."""
+        """Persist a single log line to the server database via HTTP."""
         try:
             requests.post(
                 f"{self.server_url}/api/jobs/{job_id}/log",
-                json={"stream": stream, "line": line},
-                timeout=5,
+                params={"stream": stream, "line": line},
+                timeout=3,
             )
         except requests.RequestException:
             pass
 
     def _check_job_cancelled(self, job_id: int) -> bool:
-        """Check if job has been cancelled."""
+        """Check if this job has been cancelled server-side."""
         try:
             response = requests.get(
                 f"{self.server_url}/api/jobs/{job_id}",
-                timeout=5,
+                timeout=3,
             )
             if response.status_code == 200:
-                job = response.json()
-                return job.get("status") == "canceled"
+                data = response.json()
+                return data.get("status") in ("canceled", "cancelled")
         except requests.RequestException:
             pass
         return False
@@ -399,6 +420,105 @@ class Agent:
             )
         except requests.RequestException as e:
             print(f"Failed to complete job: {e}")
+
+    # ------------------------------------------------------------------
+    # Buildkite-compatible agent helpers
+    # ------------------------------------------------------------------
+
+    def annotate(
+        self,
+        build_id: int,
+        body_html: str,
+        style: str = "info",
+        context: str = "default",
+        job_id: Optional[int] = None,
+    ) -> bool:
+        """Post or update a build annotation.
+
+        Equivalent to ``buildkite-agent annotate``.
+
+        Args:
+            build_id: The build to annotate.
+            body_html: HTML body of the annotation.
+            style: Visual style — ``success``, ``warning``, ``error``, or ``info``.
+            context: Unique key for this annotation (upserted by context).
+            job_id: Optional job that created this annotation.
+
+        Returns:
+            True on success, False on error.
+        """
+        try:
+            resp = requests.post(
+                f"{self.server_url}/api/builds/{build_id}/annotations",
+                json={
+                    "context": context,
+                    "body_html": body_html,
+                    "style": style,
+                    "created_by_job_id": job_id,
+                },
+                timeout=10,
+            )
+            return resp.status_code in (200, 201)
+        except requests.RequestException as exc:
+            print(f"annotate() failed: {exc}")
+            return False
+
+    def metadata_set(self, build_id: int, key: str, value: str, job_id: Optional[int] = None) -> bool:
+        """Set a build metadata key-value pair.
+
+        Equivalent to ``buildkite-agent meta-data set KEY VALUE``.
+        """
+        try:
+            resp = requests.post(
+                f"{self.server_url}/api/builds/{build_id}/metadata/{key}",
+                json={"value": value, "set_by_job_id": job_id},
+                timeout=10,
+            )
+            return resp.status_code in (200, 201)
+        except requests.RequestException as exc:
+            print(f"metadata_set() failed: {exc}")
+            return False
+
+    def metadata_get(self, build_id: int, key: str) -> Optional[str]:
+        """Get a build metadata value by key.
+
+        Equivalent to ``buildkite-agent meta-data get KEY``.
+        Returns None if the key is not set or on network error.
+        """
+        try:
+            resp = requests.get(
+                f"{self.server_url}/api/builds/{build_id}/metadata/{key}",
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                return resp.json().get("value")
+        except requests.RequestException as exc:
+            print(f"metadata_get() failed: {exc}")
+        return None
+
+    def pipeline_upload(self, build_id: int, pipeline_yaml: str) -> dict:
+        """Dynamically append steps to the current build.
+
+        Equivalent to ``buildkite-agent pipeline upload``.
+
+        Args:
+            build_id: The running build to append steps to.
+            pipeline_yaml: YAML string defining the new steps.
+
+        Returns:
+            Dict with ``jobs_added`` and ``job_ids`` on success, or ``{}`` on error.
+        """
+        try:
+            resp = requests.post(
+                f"{self.server_url}/api/builds/{build_id}/pipeline-upload",
+                json={"pipeline_yaml": pipeline_yaml},
+                timeout=30,
+            )
+            if resp.status_code == 200:
+                return resp.json()
+        except requests.RequestException as exc:
+            print(f"pipeline_upload() failed: {exc}")
+        return {}
 
     def run(self):
         """Main agent loop."""
@@ -504,43 +624,62 @@ class Agent:
                 time.sleep(2)
 
     def _resource_monitor_loop(self):
-        """Monitor resource usage of running jobs."""
-        import psutil
+        """Monitor resource usage of running jobs and enforce limits."""
+        try:
+            import psutil
+        except ImportError:
+            return  # psutil not available — skip monitoring
 
         while self._resource_monitor_running:
             for job_id, running in list(self._running_jobs.items()):
-                if not running.future.done():
-                    if self._check_job_cancelled(job_id):
-                        print(f"Job {job_id} cancelled - initiating graceful shutdown")
+                if running.future.done():
+                    continue
+
+                # Check server-side cancellation
+                if self._check_job_cancelled(job_id):
+                    print(f"Job {job_id} cancelled — terminating process")
+                    pid = self._job_pids.get(job_id)
+                    if pid:
                         try:
-                            process = psutil.Process(running.future.result().pid)
-                            process.terminate()
+                            proc = psutil.Process(pid)
+                            proc.terminate()
                             try:
-                                process.wait(timeout=5)
+                                proc.wait(timeout=5)
                             except psutil.TimeoutExpired:
-                                process.kill()
-                        except Exception:
+                                proc.kill()
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
                             pass
-                        continue
+                    continue
 
-                    try:
-                        process = psutil.Process(running.future.result().pid)
-                        mem_mb = process.memory_info().rss / 1024 / 1024
-                        cpu_percent = process.cpu_percent()
+                # Enforce memory/CPU limits if configured
+                if self.max_memory_mb <= 0 and self.max_cpu_percent <= 0:
+                    continue
 
-                        if self.max_memory_mb > 0 and mem_mb > self.max_memory_mb:
+                pid = self._job_pids.get(job_id)
+                if not pid:
+                    continue
+
+                try:
+                    proc = psutil.Process(pid)
+                    if self.max_memory_mb > 0:
+                        mem_mb = proc.memory_info().rss / 1024 / 1024
+                        if mem_mb > self.max_memory_mb:
                             print(
-                                f"Job {job_id} exceeded memory limit: {mem_mb:.1f}MB > {self.max_memory_mb}MB"
+                                f"Job {job_id} exceeded memory limit: "
+                                f"{mem_mb:.1f}MB > {self.max_memory_mb}MB — terminating"
                             )
-                            process.terminate()
+                            proc.terminate()
 
-                        if self.max_cpu_percent > 0 and cpu_percent > self.max_cpu_percent:
+                    if self.max_cpu_percent > 0:
+                        cpu = proc.cpu_percent(interval=0.1)
+                        if cpu > self.max_cpu_percent:
                             print(
-                                f"Job {job_id} exceeded CPU limit: {cpu_percent:.1f}% > {self.max_cpu_percent}%"
+                                f"Job {job_id} exceeded CPU limit: "
+                                f"{cpu:.1f}% > {self.max_cpu_percent}% — terminating"
                             )
-                            process.terminate()
-                    except Exception:
-                        pass
+                            proc.terminate()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
 
             time.sleep(1)
 
@@ -562,9 +701,7 @@ class Agent:
             pass
 
     def execute_job_isolated(self, job: dict, workspace: str) -> int:
-        """Execute a job in an isolated workspace."""
-        import subprocess
-
+        """Execute a job in an isolated workspace with real-time log streaming."""
         job_id = job["id"]
         label = job.get("label", f"job-{job_id}")
 
@@ -574,45 +711,51 @@ class Agent:
         container_image = job.get("container_image")
         timeout_seconds = job.get("timeout_seconds", 3600)
 
+        # Connect WebSocket for live streaming
         ws = None
         if self.use_websocket:
             try:
                 ws_url = self.server_url.replace("http", "ws") + f"/ws/jobs/{job_id}/logs"
-                import websocket
+                import websocket as _ws_lib
 
-                ws = websocket.WebSocket()
+                ws = _ws_lib.WebSocket()
                 ws.connect(ws_url, timeout=5)
             except Exception:
                 pass
 
-        def send_log(stream: str, line: str):
+        def send_line(stream: str, line: str):
             if ws:
                 try:
-                    ws.send(
-                        json.dumps(
-                            {"type": "log", "job_id": job_id, "stream": stream, "line": line}
-                        )
-                    )
+                    ws.send(json.dumps({
+                        "type": "log", "job_id": job_id, "stream": stream, "line": line,
+                    }))
                 except Exception:
                     pass
+            # Always persist to DB
             self._send_log(job_id, stream, line)
 
-        try:
-            exit_code = 0
-            stdout = ""
-            stderr = ""
+        # Build env vars
+        env_vars: dict[str, str] = {}
+        raw_env = job.get("env_vars") or {}
+        if isinstance(raw_env, str):
+            try:
+                raw_env = json.loads(raw_env)
+            except Exception:
+                raw_env = {}
+        if isinstance(raw_env, dict):
+            env_vars.update({str(k): str(v) for k, v in raw_env.items()})
 
+        env_vars.setdefault("CI", "true")
+        env_vars.setdefault("CI_ENGINE", "true")
+        env_vars.setdefault("BUILD_ID", str(job.get("build_id", "")))
+        env_vars.setdefault("JOB_ID", str(job_id))
+
+        exit_code = -1
+        try:
             if container_image:
                 from ci_engine.core.container import execute_in_container
 
-                env_vars = {}
-                env_var_str = job.get("env_vars", "")
-                if env_var_str:
-                    try:
-                        env_vars = json.loads(env_var_str)
-                    except (json.JSONDecodeError, TypeError):
-                        pass
-
+                send_line("stdout", f"==> Container: {container_image}")
                 result = execute_in_container(
                     image=container_image,
                     command=command,
@@ -622,48 +765,40 @@ class Agent:
                     build_id=job.get("build_id", 0),
                 )
                 exit_code = result.exit_code
-                stdout = result.stdout
-                stderr = result.stderr
+                for line in result.stdout.splitlines():
+                    send_line("stdout", line)
+                for line in result.stderr.splitlines():
+                    send_line("stderr", line)
             else:
                 from ci_engine.core.executor import Executor
 
                 executor = Executor(workspace=workspace)
+                send_line("stdout", f"$ {command}")
 
-                env_vars = {}
-                env_var_str = job.get("env_vars", "")
-                if env_var_str:
-                    try:
-                        env_vars = json.loads(env_var_str)
-                    except (json.JSONDecodeError, TypeError):
-                        pass
-
-                exit_code, stdout, stderr = executor.execute(
+                gen = executor.execute_streaming(
                     command=command,
                     env=env_vars if env_vars else None,
                     timeout=timeout_seconds,
                 )
-
-            if self._check_job_cancelled(job_id):
-                send_log("stderr", "Job cancelled by user")
-                return -1
-
-            if stdout:
-                send_log("stdout", stdout)
-            if stderr:
-                send_log("stderr", stderr)
+                try:
+                    while True:
+                        stream, line = next(gen)
+                        send_line(stream, line)
+                        if self._check_job_cancelled(job_id):
+                            send_line("stderr", "Job cancelled")
+                            exit_code = -1
+                            break
+                except StopIteration as e:
+                    exit_code = e.value if e.value is not None else -1
 
             return exit_code
 
-        except subprocess.TimeoutExpired:
-            send_log("stderr", f"Job timed out after {timeout_seconds}s")
-            return -1
-        except ValueError as e:
-            send_log("stderr", f"Invalid command syntax: {e}")
-            return -1
         except Exception as e:
-            send_log("stderr", str(e))
+            send_line("stderr", f"Agent error: {e}")
             return -1
         finally:
+            with self._lock:
+                self._job_pids.pop(job_id, None)
             if ws:
                 try:
                     ws.close()
@@ -728,6 +863,17 @@ def main():
         "--clear-cache",
         action="store_true",
         help="Clear skill cache before detection",
+    )
+    parser.add_argument(
+        "--ai-auto-fix",
+        action="store_true",
+        default=None,
+        help="Enable AI-powered autonomous job self-healing (requires CI_ENGINE_ANTHROPIC_API_KEY)",
+    )
+    parser.add_argument(
+        "--no-ai-auto-fix",
+        action="store_true",
+        help="Disable AI auto-fix even if API key is set (analysis-only mode)",
     )
 
     args = parser.parse_args()
@@ -797,6 +943,23 @@ def main():
         max_memory_mb=args.max_memory,
         max_cpu_percent=args.max_cpu,
     )
+
+    # Wire up AI self-healing plugin if an API key is available
+    import os as _os
+    if _os.environ.get("CI_ENGINE_ANTHROPIC_API_KEY"):
+        from ci_engine.agent.ai_healing import AIHealingPlugin
+
+        auto_fix = not args.no_ai_auto_fix
+        if args.ai_auto_fix is not None:
+            auto_fix = bool(args.ai_auto_fix)
+        healing = AIHealingPlugin(
+            server_url=args.server,
+            auto_fix=auto_fix,
+            token=_os.environ.get("CI_ENGINE_AGENT_TOKEN", ""),
+        )
+        agent._plugins.append(healing)
+        print(f"AI self-healing enabled (auto_fix={auto_fix})")
+
     agent.run()
 
 

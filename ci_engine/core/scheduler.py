@@ -6,7 +6,6 @@ from datetime import datetime, timezone
 from ci_engine.server.models import (
     Job,
     Agent,
-    AgentSkill,
     JobStatus,
     AgentStatus,
     Build,
@@ -18,9 +17,21 @@ class Scheduler:
     """Scheduler for distributing jobs to agents."""
 
     @staticmethod
-    def find_available_agent(db, required_tags: Optional[str] = None) -> Optional[Agent]:
-        """Find an available agent that matches the required tags."""
+    def find_available_agent(
+        db,
+        required_tags: Optional[str] = None,
+        queue: Optional[str] = None,
+    ) -> Optional[Agent]:
+        """Find an available agent that matches the required tags and queue."""
         query = db.query(Agent).filter(Agent.status == AgentStatus.IDLE)
+
+        # Queue routing: if job specifies a queue, only agents on that queue
+        if queue and queue != "default":
+            queue_col = getattr(Agent, "queue", None)
+            if queue_col is not None:
+                query = query.filter(
+                    (Agent.queue == queue) | (Agent.queue == None) | (Agent.queue == "default")  # noqa: E711
+                )
 
         if required_tags:
             tags_list = [t.strip() for t in required_tags.split(",")]
@@ -74,10 +85,12 @@ class Scheduler:
 
     @staticmethod
     def find_best_agent(db, job_id: int) -> Optional[Agent]:
-        """Find best available agent for a job based on tags and skills."""
+        """Find best available agent for a job based on tags, skills, and queue."""
         job = db.query(Job).filter(Job.id == job_id).first()
         if not job:
             return None
+
+        job_queue = getattr(job, "queue", "default") or "default"
 
         if job.required_skills:
             required_skills_list = [s.strip() for s in job.required_skills.split(",")]
@@ -86,13 +99,25 @@ class Scheduler:
                 return agent
 
         if job.required_tags:
-            return Scheduler.find_available_agent(db, job.required_tags)
+            return Scheduler.find_available_agent(db, job.required_tags, queue=job_queue)
 
-        return Scheduler.find_available_agent(db, None)
+        return Scheduler.find_available_agent(db, None, queue=job_queue)
+
+    @staticmethod
+    def _count_running_in_concurrency_group(db, group: str) -> int:
+        """Count RUNNING jobs in a concurrency group across all builds."""
+        return (
+            db.query(Job)
+            .filter(
+                Job.concurrency_group == group,
+                Job.status == JobStatus.RUNNING,
+            )
+            .count()
+        )
 
     @staticmethod
     def get_runnable_jobs(db, build_id: int) -> list[Job]:
-        """Get jobs that can run - dependencies satisfied and ready."""
+        """Get jobs that can run — dependencies satisfied and not blocked by concurrency."""
         jobs = db.query(Job).filter(Job.build_id == build_id).all()
 
         job_by_label = {job.label: job for job in jobs}
@@ -105,65 +130,123 @@ class Scheduler:
                 continue
 
             depends_on = job.depends_on
-            if not depends_on:
-                runnable.append(job)
-                continue
+            if depends_on:
+                deps = [d.strip() for d in depends_on.split(",") if d.strip()]
+                can_run = True
 
-            deps = [d.strip() for d in depends_on.split(",") if d.strip()]
-            can_run = True
+                for dep in deps:
+                    dep_job = None
 
-            for dep in deps:
-                dep_job = None
+                    if dep.isdigit():
+                        dep_idx = int(dep)
+                        dep_job = job_by_index.get(dep_idx)
+                    else:
+                        dep_job = job_by_label.get(dep)
 
-                if dep.isdigit():
-                    dep_idx = int(dep)
-                    dep_job = job_by_index.get(dep_idx)
-                else:
-                    dep_job = job_by_label.get(dep)
+                    if dep_job is None:
+                        continue
 
-                if dep_job is None:
+                    if dep_job.status not in (JobStatus.PASSED, JobStatus.SKIPPED):
+                        can_run = False
+                        break
+
+                if not can_run:
                     continue
 
-                if dep_job.status not in (JobStatus.PASSED, JobStatus.SKIPPED):
-                    can_run = False
-                    break
+            # Concurrency group enforcement: skip if the group is at its limit
+            cg = getattr(job, "concurrency_group", None)
+            cg_limit = getattr(job, "concurrency", None)
+            if cg and cg_limit:
+                running_in_group = Scheduler._count_running_in_concurrency_group(db, cg)
+                if running_in_group >= cg_limit:
+                    continue  # leave PENDING; next poll will reconsider
 
-            if can_run:
-                if job.status == JobStatus.BLOCKED:
-                    job.status = JobStatus.PENDING
-                runnable.append(job)
+            if job.status == JobStatus.BLOCKED:
+                job.status = JobStatus.PENDING
+            runnable.append(job)
 
         runnable.sort(key=lambda j: (-j.priority, j.step_index))
         return runnable
 
     @staticmethod
     def check_and_update_dependencies(db, build_id: int):
-        """Check failed jobs and skip their dependents."""
+        """Update job statuses based on dependency outcomes.
+
+        For each job that is still pending/blocked:
+        - If ALL its dependencies are PASSED or SKIPPED → mark as PENDING (ready to run)
+        - If ANY dependency is FAILED → mark as SKIPPED (cascade skip)
+
+        This is called after every job completion so the state machine
+        advances correctly without any external orchestrator.
+        """
         jobs = db.query(Job).filter(Job.build_id == build_id).all()
-        job_by_label = {job.label: job for job in jobs}
+        by_label = {j.label: j for j in jobs}
+        by_index = {j.step_index: j for j in jobs}
 
+        changed = False
         for job in jobs:
-            if job.status != JobStatus.FAILED:
+            if job.status not in (JobStatus.PENDING, JobStatus.BLOCKED):
                 continue
 
-            depends_on = job.depends_on
-            if not depends_on:
+            deps_raw = job.depends_on
+            if not deps_raw:
                 continue
 
-            for dep in depends_on.split(","):
-                dep = dep.strip()
-                if not dep:
-                    continue
+            deps = [d.strip() for d in deps_raw.split(",") if d.strip()]
+            if not deps:
+                continue
 
-                for j in jobs:
-                    if not j.depends_on:
-                        continue
-                    if dep in j.depends_on.split(","):
-                        if j.status == JobStatus.BLOCKED:
-                            j.status = JobStatus.SKIPPED
-                            j.finished_at = datetime.now(timezone.utc)
+            all_done = True
+            any_failed = False
 
-        db.commit()
+            for dep in deps:
+                dep_job = by_label.get(dep)
+                if dep_job is None and dep.isdigit():
+                    dep_job = by_index.get(int(dep))
+                if dep_job is None:
+                    continue  # unknown dep — treat as satisfied
+
+                # A FAILED dep with continue_on_error=True or soft_fail=True is treated as PASSED
+                dep_coe = bool(getattr(dep_job, "continue_on_error", False))
+                dep_soft = bool(getattr(dep_job, "soft_fail", False))
+                if dep_job.status == JobStatus.FAILED and not dep_coe and not dep_soft:
+                    any_failed = True
+                    break
+                terminal = (
+                    JobStatus.PASSED, JobStatus.SKIPPED, JobStatus.FAILED, JobStatus.SOFT_FAILED
+                )
+                if dep_job.status not in terminal:
+                    all_done = False
+
+            if any_failed:
+                # Cascade skip — a hard-failed dependency blocks downstream
+                job.status = JobStatus.SKIPPED
+                job.finished_at = datetime.now(timezone.utc)
+                changed = True
+            elif all_done:
+                # Check if any non-coe dep was skipped — cascade skip those too
+                any_skipped = False
+                for dep in deps:
+                    dep_job = by_label.get(dep)
+                    if dep_job is None and dep.isdigit():
+                        dep_job = by_index.get(int(dep))
+                    dep_coe = bool(getattr(dep_job, "continue_on_error", False)) if dep_job else False
+                    if dep_job and dep_job.status == JobStatus.SKIPPED and not dep_coe:
+                        any_skipped = True
+                        break
+
+                if any_skipped:
+                    job.status = JobStatus.SKIPPED
+                    job.finished_at = datetime.now(timezone.utc)
+                    changed = True
+                elif job.status == JobStatus.BLOCKED:
+                    # Dependencies all finished — unblock this job
+                    job.status = JobStatus.PENDING
+                    changed = True
+
+        if changed:
+            db.commit()
+
         Scheduler.update_build_status(db, build_id)
 
     @staticmethod
@@ -241,18 +324,33 @@ class Scheduler:
         if not jobs:
             return
 
-        pending = sum(1 for j in jobs if j.status == JobStatus.PENDING)
-        running = sum(1 for j in jobs if j.status == JobStatus.RUNNING)
-        failed = sum(1 for j in jobs if j.status == JobStatus.FAILED)
-        blocked = sum(1 for j in jobs if j.status == JobStatus.BLOCKED)
+        pending  = sum(1 for j in jobs if j.status == JobStatus.PENDING)
+        running  = sum(1 for j in jobs if j.status == JobStatus.RUNNING)
+        assigned = sum(1 for j in jobs if j.status == JobStatus.ASSIGNED)
+        blocked  = sum(1 for j in jobs if j.status == JobStatus.BLOCKED)
 
         build = db.query(Build).filter(Build.id == build_id).first()
         if not build:
             return
 
-        if failed > 0 and pending == 0 and running == 0 and blocked == 0:
-            build.status = BuildStatus.FAILED
-        elif pending == 0 and running == 0 and blocked == 0:
-            build.status = BuildStatus.PASSED
+        # Build is still active if any jobs are running/pending/assigned,
+        # OR if there are blocked wait nodes still waiting for approval.
+        active = pending + running + assigned + blocked
+
+        if active == 0:
+            # All jobs terminal: determine pass/fail
+            # continue_on_error and soft_fail failures don't fail the build
+            hard_failures = sum(
+                1 for j in jobs
+                if j.status == JobStatus.FAILED
+                and not bool(getattr(j, "continue_on_error", False))
+                and not bool(getattr(j, "soft_fail", False))
+            )
+            if hard_failures > 0:
+                build.status = BuildStatus.FAILED
+            else:
+                build.status = BuildStatus.PASSED
+        elif build.status == BuildStatus.PENDING:
+            build.status = BuildStatus.RUNNING
 
         db.commit()

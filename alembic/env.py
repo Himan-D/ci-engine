@@ -12,7 +12,14 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-from ci_engine.server.models import Base
+# Import ALL model modules so their tables are registered with Base.metadata
+# before autogenerate / create_all is invoked.
+from ci_engine.server.models import Base  # noqa: F401  (registers core tables)
+import ci_engine.server.auth              # noqa: F401  (users, api_tokens)
+import ci_engine.server.models_ai         # noqa: F401  (job_ai_analyses, build_ai_summaries)
+import ci_engine.core.secrets             # noqa: F401  (secrets)
+import ci_engine.core.audit               # noqa: F401  (audit_entries)
+import ci_engine.server.models_extensions # noqa: F401  (agent_tokens, env_approvals, analytics)
 
 target_metadata = Base.metadata
 
@@ -25,6 +32,7 @@ def run_migrations_offline() -> None:
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
+        compare_type=True,
     )
 
     with context.begin_transaction():
@@ -40,7 +48,11 @@ def run_migrations_online() -> None:
     )
 
     with connectable.connect() as connection:
-        context.configure(connection=connection, target_metadata=target_metadata)
+        context.configure(
+            connection=connection,
+            target_metadata=target_metadata,
+            compare_type=True,
+        )
 
         with context.begin_transaction():
             context.run_migrations()

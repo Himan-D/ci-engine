@@ -63,7 +63,7 @@ class TestJobResult:
         assert result.exit_code == 0
         assert result.stdout == "output"
         assert result.stderr == "error"
-        assert result.timed_out == False
+        assert not result.timed_out
         assert result.duration_ms == 100
 
 
@@ -94,7 +94,7 @@ class TestPluginRegistry:
 
         plugin = TestPlugin()
         PluginRegistry.register(plugin)
-        assert PluginRegistry.unregister("test-plugin") == True
+        assert PluginRegistry.unregister("test-plugin")
         assert len(PluginRegistry.get_plugins()) == 0
 
     def test_duplicate_registration_raises(self):
@@ -121,7 +121,7 @@ class TestAgentPlugin:
             name = "test"
 
         plugin = TestPlugin()
-        assert plugin.enabled == True
+        assert plugin.enabled
 
     def test_plugin_can_disable(self):
         """Test plugin can be disabled."""
@@ -131,7 +131,7 @@ class TestAgentPlugin:
 
         plugin = TestPlugin()
         plugin.enabled = False
-        assert plugin.enabled == False
+        assert not plugin.enabled
 
 
 class TestHookDispatcher:
@@ -213,7 +213,7 @@ class TestMiddlewareChain:
         job = {"id": 1}
         result = chain.process_pre(job)
 
-        assert result["modified"] == True
+        assert result["modified"]
 
     def test_middleware_order(self):
         """Test middleware executes in order."""

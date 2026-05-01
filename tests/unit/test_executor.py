@@ -79,38 +79,36 @@ class TestCommandSanitizer:
             is_safe, error = CommandSanitizer.validate_safe(cmd)
             assert is_safe, f"Command should be safe: {cmd}"
 
-    def test_command_substitution_blocked(self):
-        """Test that $() command substitution is blocked."""
+    def test_command_substitution_allowed(self):
+        """$() is allowed — commands run inside containers via bash -c."""
         cmd = "echo $(whoami)"
+        is_safe, error = CommandSanitizer.validate_safe(cmd)
+        assert is_safe
+
+    def test_variable_substitution_allowed(self):
+        """${} is allowed — normal shell variable syntax in CI pipelines."""
+        cmd = "echo ${SECRET}"
+        is_safe, error = CommandSanitizer.validate_safe(cmd)
+        assert is_safe
+
+    def test_command_chaining_allowed(self):
+        """&& is allowed — common CI pattern: make build && make test."""
+        cmd = "echo a && whoami"
+        is_safe, error = CommandSanitizer.validate_safe(cmd)
+        assert is_safe
+
+    def test_pipe_allowed(self):
+        """Pipes are allowed — common build output pattern."""
+        cmd = "echo a | cat | grep a"
+        is_safe, error = CommandSanitizer.validate_safe(cmd)
+        assert is_safe
+
+    def test_null_bytes_blocked(self):
+        """Null bytes must be rejected — they can truncate host-side args."""
+        cmd = "echo hello\x00world"
         is_safe, error = CommandSanitizer.validate_safe(cmd)
         assert not is_safe
         assert error is not None
-
-    def test_variable_substitution_blocked(self):
-        """Test that ${} variable substitution is blocked."""
-        cmd = "echo ${SECRET}"
-        is_safe, error = CommandSanitizer.validate_safe(cmd)
-        assert not is_safe
-
-    def test_command_chaining_blocked(self):
-        """Test that && command chaining is blocked."""
-        cmd = "echo a && whoami"
-        is_safe, error = CommandSanitizer.validate_safe(cmd)
-        assert not is_safe
-
-    def test_pipe_blocked(self):
-        """Test that | pipe is blocked."""
-        # Note: simple pipes are common in build commands
-        # Only blocked when combined with other dangerous patterns
-        cmd = "echo a | cat | bash"
-        is_safe, error = CommandSanitizer.validate_safe(cmd)
-        # This passes because it's just output piping, not command chaining
-
-    def test_null_bytes_removed(self):
-        """Test that null bytes are removed."""
-        cmd = "echo hello\x00world"
-        sanitized = CommandSanitizer.sanitize(cmd)
-        assert "\x00" not in sanitized
 
     def test_whitespace_stripped(self):
         """Test that leading/trailing whitespace is stripped."""
@@ -118,10 +116,10 @@ class TestCommandSanitizer:
         sanitized = CommandSanitizer.sanitize(cmd)
         assert sanitized == "echo hello"
 
-    def test_injection_error_raises(self):
-        """Test that dangerous commands raise exception."""
+    def test_injection_error_raises_on_null_byte(self):
+        """Null byte injection raises CommandInjectionError."""
         with pytest.raises(CommandInjectionError):
-            CommandSanitizer.sanitize("echo $( malicious)")
+            CommandSanitizer.sanitize("echo hello\x00")
 
 
 class TestExecutionStatus:

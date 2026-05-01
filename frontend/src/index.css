@@ -1,76 +1,128 @@
-:root {
-  font-family: Inter, system-ui, Avenir, Helvetica, Arial, sans-serif;
-  line-height: 1.5;
-  font-weight: 400;
-  color: #213547;
-  background-color: #0d0d0d;
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --bg-dot: #27272a;
+  }
+
+  html, body, #root {
+    @apply h-full;
+  }
+
+  body {
+    @apply bg-zinc-950 text-zinc-100 font-sans antialiased;
+    background-image: radial-gradient(var(--bg-dot) 1px, transparent 1px);
+    background-size: 24px 24px;
+    background-attachment: fixed;
+  }
+
+  /* Scrollbar */
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { @apply bg-transparent; }
+  ::-webkit-scrollbar-thumb { @apply bg-zinc-700 rounded-full; }
+  ::-webkit-scrollbar-thumb:hover { @apply bg-zinc-600; }
 }
 
-* {
-  box-sizing: border-box;
-  margin: 0;
-  padding: 0;
+@layer components {
+  /* Terminal container */
+  .terminal {
+    @apply bg-black/80 font-mono text-sm text-zinc-200 rounded-lg overflow-auto;
+    font-size: 12.5px;
+    line-height: 1.6;
+  }
+
+  .terminal-line {
+    @apply px-4 py-0 whitespace-pre-wrap break-all;
+  }
+
+  .terminal-line:hover {
+    @apply bg-white/5;
+  }
+
+  .terminal-line.stderr {
+    @apply text-red-300;
+  }
+
+  .terminal-line.timestamp {
+    @apply text-zinc-600;
+  }
+
+  /* Card */
+  .card {
+    @apply bg-zinc-900 border border-zinc-800 rounded-xl;
+  }
+
+  /* Status dot */
+  .status-dot {
+    @apply inline-block w-2 h-2 rounded-full flex-shrink-0;
+  }
+
+  /* Nav item */
+  .nav-item {
+    @apply flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors cursor-pointer;
+    @apply text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800/60;
+  }
+
+  .nav-item.active {
+    @apply text-zinc-100 bg-zinc-800;
+  }
+
+  .nav-item.active .nav-icon {
+    @apply text-brand-500;
+  }
+
+  /* Input */
+  .input {
+    @apply w-full bg-zinc-800 border border-zinc-700 text-zinc-100 rounded-lg px-3 py-2 text-sm;
+    @apply placeholder:text-zinc-500 focus:outline-none focus:border-brand-500 focus:ring-1 focus:ring-brand-500/30;
+    @apply transition-colors;
+  }
+
+  /* Button variants */
+  .btn {
+    @apply inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all cursor-pointer border-0;
+  }
+
+  .btn-primary {
+    @apply btn bg-brand-500 text-white hover:bg-brand-600 active:bg-brand-700;
+    @apply shadow-lg shadow-brand-500/20;
+  }
+
+  .btn-secondary {
+    @apply btn bg-zinc-800 text-zinc-200 border border-zinc-700 hover:bg-zinc-700 hover:text-zinc-100;
+  }
+
+  .btn-ghost {
+    @apply btn text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800/60;
+  }
+
+  .btn-danger {
+    @apply btn bg-red-900/40 text-red-300 border border-red-800/50 hover:bg-red-900/60;
+  }
+
+  .btn-sm {
+    @apply px-3 py-1.5 text-xs;
+  }
 }
 
-html, body, #root {
-  width: 100%;
-  height: 100%;
-  margin: 0;
-  padding: 0;
-  overflow: hidden;
-}
+/* Build annotation body — allow basic HTML formatting */
+.annotation-body b, .annotation-body strong { @apply font-bold; }
+.annotation-body i, .annotation-body em { @apply italic; }
+.annotation-body code { @apply font-mono text-xs bg-black/30 px-1 py-0.5 rounded; }
+.annotation-body pre { @apply font-mono text-xs bg-black/30 p-2 rounded my-1 overflow-x-auto; }
+.annotation-body ul { @apply list-disc list-inside space-y-0.5 my-1; }
+.annotation-body ol { @apply list-decimal list-inside space-y-0.5 my-1; }
+.annotation-body a { @apply underline underline-offset-2 opacity-80 hover:opacity-100; }
+.annotation-body p { @apply mb-1 last:mb-0; }
 
-body {
-  background: #0d0d0d;
-  color: #fff;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-}
-
-/* React Flow styles */
-.react-flow__node {
-  cursor: pointer;
-}
-
-.react-flow__handle {
-  cursor: crosshair;
-}
-
-.react-flow__controls {
-  background: #1a1a1a;
-  border: 1px solid #333;
-  border-radius: 6px;
-}
-
-.react-flow__controls-button {
-  background: #1a1a1a;
-  border-bottom: 1px solid #333;
-}
-
-.react-flow__controls-button:hover {
-  background: #2a2a2a;
-}
-
-.react-flow__minimap {
-  border: 1px solid #333;
-  border-radius: 6px;
-}
-
-/* Scrollbar */
-::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
-}
-
-::-webkit-scrollbar-track {
-  background: #0d0d0d;
-}
-
-::-webkit-scrollbar-thumb {
-  background: #333;
-  border-radius: 4px;
-}
-
-::-webkit-scrollbar-thumb:hover {
-  background: #444;
-}
+/* React Flow overrides */
+.react-flow__background { background-color: transparent !important; }
+.react-flow__controls { @apply bg-zinc-900 border border-zinc-800 rounded-lg overflow-hidden; box-shadow: none !important; }
+.react-flow__controls-button { @apply bg-zinc-900 border-b border-zinc-800 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100; }
+.react-flow__controls-button svg { fill: currentColor; }
+.react-flow__minimap { @apply border border-zinc-800 rounded-lg bg-zinc-900; }
+.react-flow__edge-path { stroke: #3f3f46 !important; }
+.react-flow__edge.selected .react-flow__edge-path { stroke: #f97316 !important; }
+.react-flow__node { border-radius: 10px; }
